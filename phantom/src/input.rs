@@ -3,6 +3,10 @@ use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::error::{PhantomError, Result};
@@ -33,6 +37,20 @@ const BTN_TOUCH: u16 = 0x14a;
 const TOUCHPAD_TAP_MAX: Duration = Duration::from_millis(180);
 const TOUCHPAD_DOUBLE_TAP_GAP: Duration = Duration::from_millis(220);
 
+/// If a device remains desynced longer than this (e.g. because the kernel
+/// never sends the follow-up SYN_REPORT), we force a resync so the device
+/// does not stay permanently unusable.
+const DESYNC_RESCUE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// epoll_wait timeout in the reader thread. Kept short so the thread can
+/// promptly observe the shutdown flag when the daemon exits.
+const READER_EPOLL_TIMEOUT_MS: i32 = 100;
+
+/// Number of `RawInputEvent` slots read from evdev in a single syscall.
+/// At 8000 Hz this is roughly 32 ms of buffer, which combined with the
+/// reader thread's tight loop leaves zero room for the kernel to drop.
+const READ_BATCH_SIZE: usize = 256;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct RawInputEvent {
@@ -54,6 +72,7 @@ struct InputAbsInfo {
     resolution: i32,
 }
 
+// Compile-time layout assertions to catch ABI drift on x86_64.
 const _: [(); 24] = [(); std::mem::size_of::<RawInputEvent>()];
 const _: [(); 24] = [(); std::mem::size_of::<InputAbsInfo>()];
 
@@ -82,110 +101,17 @@ pub enum MouseMotionSource {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Key {
-    A,
-    B,
-    C,
-    D,
-    E,
-    F,
-    G,
-    H,
-    I,
-    J,
-    K,
-    L,
-    M,
-    N,
-    O,
-    P,
-    Q,
-    R,
-    S,
-    T,
-    U,
-    V,
-    W,
-    X,
-    Y,
-    Z,
-    Key0,
-    Key1,
-    Key2,
-    Key3,
-    Key4,
-    Key5,
-    Key6,
-    Key7,
-    Key8,
-    Key9,
-    F1,
-    F2,
-    F3,
-    F4,
-    F5,
-    F6,
-    F7,
-    F8,
-    F9,
-    F10,
-    F11,
-    F12,
-    LeftCtrl,
-    RightCtrl,
-    LeftShift,
-    RightShift,
-    LeftAlt,
-    RightAlt,
-    LeftMeta,
-    RightMeta,
-    Up,
-    Down,
-    Left,
-    Right,
-    Home,
-    End,
-    PageUp,
-    PageDown,
-    Space,
-    Enter,
-    Backspace,
-    Delete,
-    Insert,
-    Tab,
-    Esc,
-    Minus,
-    Equal,
-    LeftBrace,
-    RightBrace,
-    Semicolon,
-    Apostrophe,
-    Grave,
-    Backslash,
-    Comma,
-    Dot,
-    Slash,
-    CapsLock,
-    NumLock,
-    ScrollLock,
-    SysRq,
-    Pause,
-    KP0,
-    KP1,
-    KP2,
-    KP3,
-    KP4,
-    KP5,
-    KP6,
-    KP7,
-    KP8,
-    KP9,
-    MouseLeft,
-    MouseRight,
-    MouseMiddle,
-    MouseBack,
-    MouseForward,
-    WheelUp,
-    WheelDown,
+    A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z,
+    Key0, Key1, Key2, Key3, Key4, Key5, Key6, Key7, Key8, Key9,
+    F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12,
+    LeftCtrl, RightCtrl, LeftShift, RightShift, LeftAlt, RightAlt, LeftMeta, RightMeta,
+    Up, Down, Left, Right, Home, End, PageUp, PageDown,
+    Space, Enter, Backspace, Delete, Insert, Tab, Esc,
+    Minus, Equal, LeftBrace, RightBrace, Semicolon, Apostrophe, Grave, Backslash, Comma, Dot, Slash,
+    CapsLock, NumLock, ScrollLock, SysRq, Pause,
+    KP0, KP1, KP2, KP3, KP4, KP5, KP6, KP7, KP8, KP9,
+    MouseLeft, MouseRight, MouseMiddle, MouseBack, MouseForward,
+    WheelUp, WheelDown,
     Unknown(u16),
 }
 
@@ -197,141 +123,58 @@ impl Key {
     pub fn android_passthrough_repeats(self) -> bool {
         matches!(
             self,
-            Key::Backspace
-                | Key::Delete
-                | Key::Enter
-                | Key::Up
-                | Key::Down
-                | Key::Left
-                | Key::Right
+            Key::Backspace | Key::Delete | Key::Enter | Key::Up | Key::Down | Key::Left | Key::Right
         )
     }
 
     pub fn android_keycode(self) -> Option<u16> {
         match self {
-            Key::A => Some(29),
-            Key::B => Some(30),
-            Key::C => Some(31),
-            Key::D => Some(32),
-            Key::E => Some(33),
-            Key::F => Some(34),
-            Key::G => Some(35),
-            Key::H => Some(36),
-            Key::I => Some(37),
-            Key::J => Some(38),
-            Key::K => Some(39),
-            Key::L => Some(40),
-            Key::M => Some(41),
-            Key::N => Some(42),
-            Key::O => Some(43),
-            Key::P => Some(44),
-            Key::Q => Some(45),
-            Key::R => Some(46),
-            Key::S => Some(47),
-            Key::T => Some(48),
-            Key::U => Some(49),
-            Key::V => Some(50),
-            Key::W => Some(51),
-            Key::X => Some(52),
-            Key::Y => Some(53),
-            Key::Z => Some(54),
-            Key::Key0 => Some(7),
-            Key::Key1 => Some(8),
-            Key::Key2 => Some(9),
-            Key::Key3 => Some(10),
-            Key::Key4 => Some(11),
-            Key::Key5 => Some(12),
-            Key::Key6 => Some(13),
-            Key::Key7 => Some(14),
-            Key::Key8 => Some(15),
-            Key::Key9 => Some(16),
-            Key::F1 => Some(131),
-            Key::F2 => Some(132),
-            Key::F3 => Some(133),
-            Key::F4 => Some(134),
-            Key::F5 => Some(135),
-            Key::F6 => Some(136),
-            Key::F7 => Some(137),
-            Key::F8 => Some(138),
-            Key::F9 => Some(139),
-            Key::F10 => Some(140),
-            Key::F11 => Some(141),
-            Key::F12 => Some(142),
-            Key::LeftCtrl => Some(113),
-            Key::RightCtrl => Some(114),
-            Key::LeftShift => Some(59),
-            Key::RightShift => Some(60),
-            Key::LeftAlt => Some(57),
-            Key::RightAlt => Some(58),
-            Key::Up => Some(19),
-            Key::Down => Some(20),
-            Key::Left => Some(21),
-            Key::Right => Some(22),
-            Key::End => Some(123),
-            Key::PageUp => Some(92),
-            Key::PageDown => Some(93),
-            Key::Space => Some(62),
-            Key::Enter => Some(66),
-            Key::Backspace => Some(67),
-            Key::Delete => Some(112),
-            Key::Insert => Some(124),
-            Key::Tab => Some(61),
-            Key::Esc => Some(111),
-            Key::Minus => Some(69),
-            Key::Equal => Some(70),
-            Key::LeftBrace => Some(71),
-            Key::RightBrace => Some(72),
-            Key::Semicolon => Some(74),
-            Key::Apostrophe => Some(75),
-            Key::Grave => Some(68),
-            Key::Backslash => Some(73),
-            Key::Comma => Some(55),
-            Key::Dot => Some(56),
-            Key::Slash => Some(76),
-            Key::CapsLock => Some(115),
-            Key::NumLock => Some(143),
-            Key::ScrollLock => Some(116),
-            Key::SysRq => Some(120),
-            Key::Pause => Some(121),
-            Key::KP0 => Some(144),
-            Key::KP1 => Some(145),
-            Key::KP2 => Some(146),
-            Key::KP3 => Some(147),
-            Key::KP4 => Some(148),
-            Key::KP5 => Some(149),
-            Key::KP6 => Some(150),
-            Key::KP7 => Some(151),
-            Key::KP8 => Some(152),
-            Key::KP9 => Some(153),
+            Key::A => Some(29), Key::B => Some(30), Key::C => Some(31), Key::D => Some(32),
+            Key::E => Some(33), Key::F => Some(34), Key::G => Some(35), Key::H => Some(36),
+            Key::I => Some(37), Key::J => Some(38), Key::K => Some(39), Key::L => Some(40),
+            Key::M => Some(41), Key::N => Some(42), Key::O => Some(43), Key::P => Some(44),
+            Key::Q => Some(45), Key::R => Some(46), Key::S => Some(47), Key::T => Some(48),
+            Key::U => Some(49), Key::V => Some(50), Key::W => Some(51), Key::X => Some(52),
+            Key::Y => Some(53), Key::Z => Some(54),
+            Key::Key0 => Some(7), Key::Key1 => Some(8), Key::Key2 => Some(9), Key::Key3 => Some(10),
+            Key::Key4 => Some(11), Key::Key5 => Some(12), Key::Key6 => Some(13), Key::Key7 => Some(14),
+            Key::Key8 => Some(15), Key::Key9 => Some(16),
+            Key::F1 => Some(131), Key::F2 => Some(132), Key::F3 => Some(133), Key::F4 => Some(134),
+            Key::F5 => Some(135), Key::F6 => Some(136), Key::F7 => Some(137), Key::F8 => Some(138),
+            Key::F9 => Some(139), Key::F10 => Some(140), Key::F11 => Some(141), Key::F12 => Some(142),
+            Key::LeftCtrl => Some(113), Key::RightCtrl => Some(114),
+            Key::LeftShift => Some(59), Key::RightShift => Some(60),
+            Key::LeftAlt => Some(57), Key::RightAlt => Some(58),
+            Key::Up => Some(19), Key::Down => Some(20), Key::Left => Some(21), Key::Right => Some(22),
+            Key::End => Some(123), Key::PageUp => Some(92), Key::PageDown => Some(93),
+            Key::Space => Some(62), Key::Enter => Some(66), Key::Backspace => Some(67),
+            Key::Delete => Some(112), Key::Insert => Some(124), Key::Tab => Some(61), Key::Esc => Some(111),
+            Key::Minus => Some(69), Key::Equal => Some(70),
+            Key::LeftBrace => Some(71), Key::RightBrace => Some(72), Key::Semicolon => Some(74),
+            Key::Apostrophe => Some(75), Key::Grave => Some(68), Key::Backslash => Some(73),
+            Key::Comma => Some(55), Key::Dot => Some(56), Key::Slash => Some(76),
+            Key::CapsLock => Some(115), Key::NumLock => Some(143), Key::ScrollLock => Some(116),
+            Key::SysRq => Some(120), Key::Pause => Some(121),
+            Key::KP0 => Some(144), Key::KP1 => Some(145), Key::KP2 => Some(146), Key::KP3 => Some(147),
+            Key::KP4 => Some(148), Key::KP5 => Some(149), Key::KP6 => Some(150), Key::KP7 => Some(151),
+            Key::KP8 => Some(152), Key::KP9 => Some(153),
             Key::Home | Key::LeftMeta | Key::RightMeta => None,
-            Key::MouseLeft
-            | Key::MouseRight
-            | Key::MouseMiddle
-            | Key::MouseBack
-            | Key::MouseForward
-            | Key::WheelUp
-            | Key::WheelDown
-            | Key::Unknown(_) => None,
+            Key::MouseLeft | Key::MouseRight | Key::MouseMiddle | Key::MouseBack | Key::MouseForward
+            | Key::WheelUp | Key::WheelDown | Key::Unknown(_) => None,
         }
     }
 
     pub fn is_mouse(self) -> bool {
         matches!(
             self,
-            Key::MouseLeft
-                | Key::MouseRight
-                | Key::MouseMiddle
-                | Key::MouseBack
-                | Key::MouseForward
-                | Key::WheelUp
-                | Key::WheelDown
+            Key::MouseLeft | Key::MouseRight | Key::MouseMiddle | Key::MouseBack
+            | Key::MouseForward | Key::WheelUp | Key::WheelDown
         )
     }
 
     pub fn parse_name(s: &str) -> Option<Key> {
         let upper = s.to_uppercase();
         match upper.as_str() {
-            // Aliases
             "CTRL" => Some(Key::LeftCtrl),
             "SHIFT" => Some(Key::LeftShift),
             "ALT" => Some(Key::LeftAlt),
@@ -367,7 +210,6 @@ impl Key {
             "RIGHTALT" => Some(Key::RightAlt),
             "LEFTMETA" => Some(Key::LeftMeta),
             "RIGHTMETA" => Some(Key::RightMeta),
-            // Punctuation
             "MINUS" | "-" => Some(Key::Minus),
             "EQUAL" | "=" => Some(Key::Equal),
             "LEFTBRACE" | "[" => Some(Key::LeftBrace),
@@ -379,72 +221,27 @@ impl Key {
             "COMMA" | "," => Some(Key::Comma),
             "DOT" | "." => Some(Key::Dot),
             "SLASH" | "/" => Some(Key::Slash),
-            // Locks and system
             "NUMLOCK" => Some(Key::NumLock),
             "SCROLLLOCK" => Some(Key::ScrollLock),
             "SYSRQ" => Some(Key::SysRq),
             "PAUSE" => Some(Key::Pause),
-            // Letters
-            "A" => Some(Key::A),
-            "B" => Some(Key::B),
-            "C" => Some(Key::C),
-            "D" => Some(Key::D),
-            "E" => Some(Key::E),
-            "F" => Some(Key::F),
-            "G" => Some(Key::G),
-            "H" => Some(Key::H),
-            "I" => Some(Key::I),
-            "J" => Some(Key::J),
-            "K" => Some(Key::K),
-            "L" => Some(Key::L),
-            "M" => Some(Key::M),
-            "N" => Some(Key::N),
-            "O" => Some(Key::O),
-            "P" => Some(Key::P),
-            "Q" => Some(Key::Q),
-            "R" => Some(Key::R),
-            "S" => Some(Key::S),
-            "T" => Some(Key::T),
-            "U" => Some(Key::U),
-            "V" => Some(Key::V),
-            "W" => Some(Key::W),
-            "X" => Some(Key::X),
-            "Y" => Some(Key::Y),
-            "Z" => Some(Key::Z),
-            // Numbers
-            "0" => Some(Key::Key0),
-            "1" => Some(Key::Key1),
-            "2" => Some(Key::Key2),
-            "3" => Some(Key::Key3),
-            "4" => Some(Key::Key4),
-            "5" => Some(Key::Key5),
-            "6" => Some(Key::Key6),
-            "7" => Some(Key::Key7),
-            "8" => Some(Key::Key8),
+            "A" => Some(Key::A), "B" => Some(Key::B), "C" => Some(Key::C), "D" => Some(Key::D),
+            "E" => Some(Key::E), "F" => Some(Key::F), "G" => Some(Key::G), "H" => Some(Key::H),
+            "I" => Some(Key::I), "J" => Some(Key::J), "K" => Some(Key::K), "L" => Some(Key::L),
+            "M" => Some(Key::M), "N" => Some(Key::N), "O" => Some(Key::O), "P" => Some(Key::P),
+            "Q" => Some(Key::Q), "R" => Some(Key::R), "S" => Some(Key::S), "T" => Some(Key::T),
+            "U" => Some(Key::U), "V" => Some(Key::V), "W" => Some(Key::W), "X" => Some(Key::X),
+            "Y" => Some(Key::Y), "Z" => Some(Key::Z),
+            "0" => Some(Key::Key0), "1" => Some(Key::Key1), "2" => Some(Key::Key2),
+            "3" => Some(Key::Key3), "4" => Some(Key::Key4), "5" => Some(Key::Key5),
+            "6" => Some(Key::Key6), "7" => Some(Key::Key7), "8" => Some(Key::Key8),
             "9" => Some(Key::Key9),
-            // Function keys
-            "F1" => Some(Key::F1),
-            "F2" => Some(Key::F2),
-            "F3" => Some(Key::F3),
-            "F4" => Some(Key::F4),
-            "F5" => Some(Key::F5),
-            "F6" => Some(Key::F6),
-            "F7" => Some(Key::F7),
-            "F8" => Some(Key::F8),
-            "F9" => Some(Key::F9),
-            "F10" => Some(Key::F10),
-            "F11" => Some(Key::F11),
-            "F12" => Some(Key::F12),
-            // Numpad
-            "KP0" => Some(Key::KP0),
-            "KP1" => Some(Key::KP1),
-            "KP2" => Some(Key::KP2),
-            "KP3" => Some(Key::KP3),
-            "KP4" => Some(Key::KP4),
-            "KP5" => Some(Key::KP5),
-            "KP6" => Some(Key::KP6),
-            "KP7" => Some(Key::KP7),
-            "KP8" => Some(Key::KP8),
+            "F1" => Some(Key::F1), "F2" => Some(Key::F2), "F3" => Some(Key::F3), "F4" => Some(Key::F4),
+            "F5" => Some(Key::F5), "F6" => Some(Key::F6), "F7" => Some(Key::F7), "F8" => Some(Key::F8),
+            "F9" => Some(Key::F9), "F10" => Some(Key::F10), "F11" => Some(Key::F11), "F12" => Some(Key::F12),
+            "KP0" => Some(Key::KP0), "KP1" => Some(Key::KP1), "KP2" => Some(Key::KP2),
+            "KP3" => Some(Key::KP3), "KP4" => Some(Key::KP4), "KP5" => Some(Key::KP5),
+            "KP6" => Some(Key::KP6), "KP7" => Some(Key::KP7), "KP8" => Some(Key::KP8),
             "KP9" => Some(Key::KP9),
             _ => None,
         }
@@ -453,106 +250,39 @@ impl Key {
     pub fn evdev_code(self) -> Option<u16> {
         match self {
             Key::Esc => Some(1),
-            Key::Key1 => Some(2),
-            Key::Key2 => Some(3),
-            Key::Key3 => Some(4),
-            Key::Key4 => Some(5),
-            Key::Key5 => Some(6),
-            Key::Key6 => Some(7),
-            Key::Key7 => Some(8),
-            Key::Key8 => Some(9),
-            Key::Key9 => Some(10),
-            Key::Key0 => Some(11),
-            Key::Minus => Some(12),
-            Key::Equal => Some(13),
-            Key::Backspace => Some(14),
-            Key::Tab => Some(15),
-            Key::Q => Some(16),
-            Key::W => Some(17),
-            Key::E => Some(18),
-            Key::R => Some(19),
-            Key::T => Some(20),
-            Key::Y => Some(21),
-            Key::U => Some(22),
-            Key::I => Some(23),
-            Key::O => Some(24),
-            Key::P => Some(25),
-            Key::LeftBrace => Some(26),
-            Key::RightBrace => Some(27),
-            Key::Enter => Some(28),
+            Key::Key1 => Some(2), Key::Key2 => Some(3), Key::Key3 => Some(4), Key::Key4 => Some(5),
+            Key::Key5 => Some(6), Key::Key6 => Some(7), Key::Key7 => Some(8), Key::Key8 => Some(9),
+            Key::Key9 => Some(10), Key::Key0 => Some(11),
+            Key::Minus => Some(12), Key::Equal => Some(13), Key::Backspace => Some(14), Key::Tab => Some(15),
+            Key::Q => Some(16), Key::W => Some(17), Key::E => Some(18), Key::R => Some(19),
+            Key::T => Some(20), Key::Y => Some(21), Key::U => Some(22), Key::I => Some(23),
+            Key::O => Some(24), Key::P => Some(25),
+            Key::LeftBrace => Some(26), Key::RightBrace => Some(27), Key::Enter => Some(28),
             Key::LeftCtrl => Some(29),
-            Key::A => Some(30),
-            Key::S => Some(31),
-            Key::D => Some(32),
-            Key::F => Some(33),
-            Key::G => Some(34),
-            Key::H => Some(35),
-            Key::J => Some(36),
-            Key::K => Some(37),
-            Key::L => Some(38),
-            Key::Semicolon => Some(39),
-            Key::Apostrophe => Some(40),
-            Key::Grave => Some(41),
-            Key::LeftShift => Some(42),
-            Key::Backslash => Some(43),
-            Key::Z => Some(44),
-            Key::X => Some(45),
-            Key::C => Some(46),
-            Key::V => Some(47),
-            Key::B => Some(48),
-            Key::N => Some(49),
-            Key::M => Some(50),
-            Key::Comma => Some(51),
-            Key::Dot => Some(52),
-            Key::Slash => Some(53),
-            Key::RightShift => Some(54),
-            Key::LeftAlt => Some(56),
-            Key::Space => Some(57),
-            Key::CapsLock => Some(58),
-            Key::F1 => Some(59),
-            Key::F2 => Some(60),
-            Key::F3 => Some(61),
-            Key::F4 => Some(62),
-            Key::F5 => Some(63),
-            Key::F6 => Some(64),
-            Key::F7 => Some(65),
-            Key::F8 => Some(66),
-            Key::F9 => Some(67),
-            Key::F10 => Some(68),
-            Key::NumLock => Some(69),
-            Key::ScrollLock => Some(70),
-            Key::KP7 => Some(71),
-            Key::KP8 => Some(72),
-            Key::KP9 => Some(73),
-            Key::KP4 => Some(74),
-            Key::KP5 => Some(75),
-            Key::KP6 => Some(76),
-            Key::KP1 => Some(77),
-            Key::KP2 => Some(78),
-            Key::KP3 => Some(79),
-            Key::KP0 => Some(80),
-            Key::F11 => Some(87),
-            Key::F12 => Some(88),
-            Key::RightCtrl => Some(97),
-            Key::SysRq => Some(99),
-            Key::RightAlt => Some(100),
-            Key::Home => Some(102),
-            Key::Up => Some(103),
-            Key::PageUp => Some(104),
-            Key::Left => Some(105),
-            Key::Right => Some(106),
-            Key::End => Some(107),
-            Key::Down => Some(108),
-            Key::PageDown => Some(109),
-            Key::Insert => Some(110),
-            Key::Delete => Some(111),
-            Key::Pause => Some(119),
-            Key::LeftMeta => Some(125),
-            Key::RightMeta => Some(126),
-            Key::MouseLeft => Some(0x110),
-            Key::MouseRight => Some(0x111),
-            Key::MouseMiddle => Some(0x112),
-            Key::MouseBack => Some(0x113),
+            Key::A => Some(30), Key::S => Some(31), Key::D => Some(32), Key::F => Some(33),
+            Key::G => Some(34), Key::H => Some(35), Key::J => Some(36), Key::K => Some(37),
+            Key::L => Some(38), Key::Semicolon => Some(39), Key::Apostrophe => Some(40), Key::Grave => Some(41),
+            Key::LeftShift => Some(42), Key::Backslash => Some(43),
+            Key::Z => Some(44), Key::X => Some(45), Key::C => Some(46), Key::V => Some(47),
+            Key::B => Some(48), Key::N => Some(49), Key::M => Some(50),
+            Key::Comma => Some(51), Key::Dot => Some(52), Key::Slash => Some(53), Key::RightShift => Some(54),
+            Key::LeftAlt => Some(56), Key::Space => Some(57), Key::CapsLock => Some(58),
+            Key::F1 => Some(59), Key::F2 => Some(60), Key::F3 => Some(61), Key::F4 => Some(62),
+            Key::F5 => Some(63), Key::F6 => Some(64), Key::F7 => Some(65), Key::F8 => Some(66),
+            Key::F9 => Some(67), Key::F10 => Some(68),
+            Key::NumLock => Some(69), Key::ScrollLock => Some(70),
+            Key::KP7 => Some(71), Key::KP8 => Some(72), Key::KP9 => Some(73), Key::KP4 => Some(74),
+            Key::KP5 => Some(75), Key::KP6 => Some(76), Key::KP1 => Some(77), Key::KP2 => Some(78),
+            Key::KP3 => Some(79), Key::KP0 => Some(80),
+            Key::F11 => Some(87), Key::F12 => Some(88),
+            Key::RightCtrl => Some(97), Key::SysRq => Some(99), Key::RightAlt => Some(100),
+            Key::Home => Some(102), Key::Up => Some(103), Key::PageUp => Some(104),
+            Key::Left => Some(105), Key::Right => Some(106), Key::End => Some(107),
+            Key::Down => Some(108), Key::PageDown => Some(109), Key::Insert => Some(110),
+            Key::Delete => Some(111), Key::Pause => Some(119),
+            Key::LeftMeta => Some(125), Key::RightMeta => Some(126),
+            Key::MouseLeft => Some(0x110), Key::MouseRight => Some(0x111),
+            Key::MouseMiddle => Some(0x112), Key::MouseBack => Some(0x113),
             Key::MouseForward => Some(0x114),
             Key::Unknown(code) => Some(code),
             Key::WheelUp | Key::WheelDown => None,
@@ -582,125 +312,50 @@ impl InputEvent {
 
 impl FromStr for Key {
     type Err = &'static str;
-
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         Self::parse_name(s).ok_or("unknown key")
     }
 }
 
-/// Map linux evdev key codes to our Key enum.
+/// Map a raw Linux evdev key code to our `Key` enum.
 fn evdev_code_to_key(code: u16) -> Option<Key> {
     match code {
         1 => Some(Key::Esc),
         2..=11 => Some(
-            [
-                Key::Key1,
-                Key::Key2,
-                Key::Key3,
-                Key::Key4,
-                Key::Key5,
-                Key::Key6,
-                Key::Key7,
-                Key::Key8,
-                Key::Key9,
-                Key::Key0,
-            ][(code - 2) as usize],
+            [Key::Key1, Key::Key2, Key::Key3, Key::Key4, Key::Key5,
+            Key::Key6, Key::Key7, Key::Key8, Key::Key9, Key::Key0][(code - 2) as usize],
         ),
-        12 => Some(Key::Minus),
-        13 => Some(Key::Equal),
-        14 => Some(Key::Backspace),
-        15 => Some(Key::Tab),
-        16 => Some(Key::Q),
-        17 => Some(Key::W),
-        18 => Some(Key::E),
-        19 => Some(Key::R),
-        20 => Some(Key::T),
-        21 => Some(Key::Y),
-        22 => Some(Key::U),
-        23 => Some(Key::I),
-        24 => Some(Key::O),
-        25 => Some(Key::P),
-        26 => Some(Key::LeftBrace),
-        27 => Some(Key::RightBrace),
-        28 => Some(Key::Enter),
-        29 => Some(Key::LeftCtrl),
-        30 => Some(Key::A),
-        31 => Some(Key::S),
-        32 => Some(Key::D),
-        33 => Some(Key::F),
-        34 => Some(Key::G),
-        35 => Some(Key::H),
-        36 => Some(Key::J),
-        37 => Some(Key::K),
-        38 => Some(Key::L),
-        39 => Some(Key::Semicolon),
-        40 => Some(Key::Apostrophe),
-        41 => Some(Key::Grave),
-        42 => Some(Key::LeftShift),
-        43 => Some(Key::Backslash),
-        44 => Some(Key::Z),
-        45 => Some(Key::X),
-        46 => Some(Key::C),
-        47 => Some(Key::V),
-        48 => Some(Key::B),
-        49 => Some(Key::N),
-        50 => Some(Key::M),
-        51 => Some(Key::Comma),
-        52 => Some(Key::Dot),
-        53 => Some(Key::Slash),
-        54 => Some(Key::RightShift),
-        55 => Some(Key::Unknown(55)), // KP*
-        56 => Some(Key::LeftAlt),
-        57 => Some(Key::Space),
-        58 => Some(Key::CapsLock),
+        12 => Some(Key::Minus), 13 => Some(Key::Equal), 14 => Some(Key::Backspace), 15 => Some(Key::Tab),
+        16 => Some(Key::Q), 17 => Some(Key::W), 18 => Some(Key::E), 19 => Some(Key::R),
+        20 => Some(Key::T), 21 => Some(Key::Y), 22 => Some(Key::U), 23 => Some(Key::I),
+        24 => Some(Key::O), 25 => Some(Key::P),
+        26 => Some(Key::LeftBrace), 27 => Some(Key::RightBrace), 28 => Some(Key::Enter), 29 => Some(Key::LeftCtrl),
+        30 => Some(Key::A), 31 => Some(Key::S), 32 => Some(Key::D), 33 => Some(Key::F),
+        34 => Some(Key::G), 35 => Some(Key::H), 36 => Some(Key::J), 37 => Some(Key::K),
+        38 => Some(Key::L), 39 => Some(Key::Semicolon), 40 => Some(Key::Apostrophe), 41 => Some(Key::Grave),
+        42 => Some(Key::LeftShift), 43 => Some(Key::Backslash),
+        44 => Some(Key::Z), 45 => Some(Key::X), 46 => Some(Key::C), 47 => Some(Key::V),
+        48 => Some(Key::B), 49 => Some(Key::N), 50 => Some(Key::M),
+        51 => Some(Key::Comma), 52 => Some(Key::Dot), 53 => Some(Key::Slash), 54 => Some(Key::RightShift),
+        55 => Some(Key::Unknown(55)),
+        56 => Some(Key::LeftAlt), 57 => Some(Key::Space), 58 => Some(Key::CapsLock),
         59..=68 => Some(
-            [
-                Key::F1,
-                Key::F2,
-                Key::F3,
-                Key::F4,
-                Key::F5,
-                Key::F6,
-                Key::F7,
-                Key::F8,
-                Key::F9,
-                Key::F10,
-            ][(code - 59) as usize],
+            [Key::F1, Key::F2, Key::F3, Key::F4, Key::F5,
+            Key::F6, Key::F7, Key::F8, Key::F9, Key::F10][(code - 59) as usize],
         ),
-        69 => Some(Key::NumLock),
-        70 => Some(Key::ScrollLock),
-        // Numpad 7-9, 4-6, 1-3, 0
-        71 => Some(Key::KP7),
-        72 => Some(Key::KP8),
-        73 => Some(Key::KP9),
-        74 => Some(Key::KP4),
-        75 => Some(Key::KP5),
-        76 => Some(Key::KP6),
-        77 => Some(Key::KP1),
-        78 => Some(Key::KP2),
-        79 => Some(Key::KP3),
-        80 => Some(Key::KP0),
-        87 => Some(Key::F11),
-        88 => Some(Key::F12),
-        97 => Some(Key::RightCtrl),
-        99 => Some(Key::SysRq),
-        100 => Some(Key::RightAlt),
-        102 => Some(Key::Home),
-        103 => Some(Key::Up),
-        104 => Some(Key::PageUp),
-        105 => Some(Key::Left),
-        106 => Some(Key::Right),
-        107 => Some(Key::End),
-        108 => Some(Key::Down),
-        109 => Some(Key::PageDown),
-        110 => Some(Key::Insert),
-        111 => Some(Key::Delete),
-        119 => Some(Key::Pause),
+        69 => Some(Key::NumLock), 70 => Some(Key::ScrollLock),
+        71 => Some(Key::KP7), 72 => Some(Key::KP8), 73 => Some(Key::KP9), 74 => Some(Key::KP4),
+        75 => Some(Key::KP5), 76 => Some(Key::KP6), 77 => Some(Key::KP1), 78 => Some(Key::KP2),
+        79 => Some(Key::KP3), 80 => Some(Key::KP0),
+        87 => Some(Key::F11), 88 => Some(Key::F12),
+        97 => Some(Key::RightCtrl), 99 => Some(Key::SysRq), 100 => Some(Key::RightAlt),
+        102 => Some(Key::Home), 103 => Some(Key::Up), 104 => Some(Key::PageUp),
+        105 => Some(Key::Left), 106 => Some(Key::Right), 107 => Some(Key::End),
+        108 => Some(Key::Down), 109 => Some(Key::PageDown), 110 => Some(Key::Insert),
+        111 => Some(Key::Delete), 119 => Some(Key::Pause),
         125 => Some(Key::LeftMeta),
-        0x110 => Some(Key::MouseLeft),
-        0x111 => Some(Key::MouseRight),
-        0x112 => Some(Key::MouseMiddle),
-        0x113 => Some(Key::MouseBack),
+        0x110 => Some(Key::MouseLeft), 0x111 => Some(Key::MouseRight),
+        0x112 => Some(Key::MouseMiddle), 0x113 => Some(Key::MouseBack),
         0x114 => Some(Key::MouseForward),
         _ => Some(Key::Unknown(code)),
     }
@@ -729,7 +384,13 @@ pub struct DeviceInfo {
     last_touchpad_tap_release_at: Option<Instant>,
     pending_touchpad_tap_deadline: Option<Instant>,
     pressed_keys: HashSet<Key>,
+    /// Set when SYN_DROPPED was received but the following SYN_REPORT has
+    /// not arrived yet. While this flag is set, events from the device are
+    /// ignored (they may be inconsistent) until we can resync.
     desynced: bool,
+    /// Wall-clock time when the device entered the desynced state. Used by
+    /// the rescue timer to force a resync if SYN_REPORT never arrives.
+    desynced_at: Option<Instant>,
 }
 
 impl DeviceInfo {
@@ -741,9 +402,19 @@ impl DeviceInfo {
 pub struct InputCapture {
     devices: Vec<DeviceInfo>,
     fd_to_index: HashMap<RawFd, usize>,
+    /// epoll fd. In production this lives inside the reader thread, so the
+    /// value here is -1. It is only valid when `reader_rx` is `None`
+    /// (direct-poll mode used by unit tests).
     epoll_fd: RawFd,
     mouse_grabbed: bool,
     keyboard_grabbed: bool,
+    /// Channel receiving event batches from the reader thread.
+    /// `Some(...)` when the threaded reader is active.
+    reader_rx: Option<Receiver<Vec<(RawFd, RawInputEvent)>>>,
+    /// Handle of the reader thread, joined on drop.
+    reader_thread: Option<JoinHandle<()>>,
+    /// Flag used to ask the reader thread to stop.
+    stop_reader: Option<Arc<AtomicBool>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -754,9 +425,17 @@ enum PointerKind {
 }
 
 impl InputCapture {
-    /// Discover input devices and set up epoll for reading.
-    /// Device discovery itself does not decide the grab policy.
-    /// The daemon applies the runtime grab policy after startup.
+    /// Discover input devices and start a dedicated reader thread.
+    ///
+    /// Device discovery itself does not decide the grab policy; the daemon
+    /// applies the runtime grab policy after startup via `set_grabbed_*`.
+    ///
+    /// The reader thread continuously drains the kernel-side evdev buffer
+    /// (which is only 64 events per client by default — about 8 ms at
+    /// 8000 Hz) and forwards batches over an mpsc channel. The main loop
+    /// then consumes from the channel at its own pace, so transient
+    /// blocking (e.g. sending a packet over the TCP socket to Android)
+    /// can no longer cause `SYN_DROPPED`.
     pub fn discover() -> Result<Self> {
         let mut devices = Vec::new();
         let entries = fs::read_dir("/dev/input").map_err(|e| PhantomError::DeviceNotFound {
@@ -766,20 +445,16 @@ impl InputCapture {
         for entry in entries.flatten() {
             let path = entry.path();
             let path_str = path.to_string_lossy().to_string();
-
             if !path_str.contains("event") {
                 continue;
             }
-
             match Self::probe_device_open(&path_str) {
                 Ok(Some(info)) => {
                     tracing::info!("watching: {} ({})", path_str, info.name);
                     devices.push(info);
                 }
                 Ok(None) => {}
-                Err(e) => {
-                    tracing::warn!("skipped {}: {}", path_str, e);
-                }
+                Err(e) => tracing::warn!("skipped {}: {}", path_str, e),
             }
         }
 
@@ -799,24 +474,100 @@ impl InputCapture {
                 events: (libc::EPOLLIN | libc::EPOLLET) as u32,
                 u64: dev.fd() as u64,
             };
-            let ret =
-                unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, dev.fd(), &mut event) };
+            let ret = unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, dev.fd(), &mut event) };
             if ret < 0 {
                 return Err(PhantomError::Io(std::io::Error::last_os_error()));
             }
         }
 
-        tracing::info!("watching {} input devices", devices.len());
+        tracing::info!("watching {} input devices (threaded reader)", devices.len());
+
+        // Spawn the reader thread. It owns the epoll fd and closes it on exit.
+        let (tx, rx) = mpsc::channel::<Vec<(RawFd, RawInputEvent)>>();
+        let stop_reader = Arc::new(AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop_reader);
+        let reader_thread = thread::Builder::new()
+        .name("phantom-evdev-reader".into())
+        .spawn(move || {
+            Self::reader_loop(epoll_fd, tx, stop_clone);
+            unsafe {
+                libc::close(epoll_fd);
+            }
+        })
+        .map_err(PhantomError::Io)?;
+
         Ok(Self {
             devices,
             fd_to_index,
-            epoll_fd,
+            epoll_fd: -1,
             mouse_grabbed: false,
             keyboard_grabbed: false,
+            reader_rx: Some(rx),
+           reader_thread: Some(reader_thread),
+           stop_reader: Some(stop_reader),
         })
     }
 
+    /// Body of the reader thread.
+    ///
+    /// It blocks on `epoll_wait`, drains every ready fd, and forwards
+    /// batches to the main thread. Because the loop does nothing else,
+    /// the kernel-side evdev buffer is emptied within microseconds of
+    /// events arriving, even at very high polling rates.
+    fn reader_loop(
+        epoll_fd: RawFd,
+        tx: Sender<Vec<(RawFd, RawInputEvent)>>,
+                   stop: Arc<AtomicBool>,
+    ) {
+        let mut epoll_events = [libc::epoll_event { events: 0, u64: 0 }; 16];
+        while !stop.load(Ordering::Relaxed) {
+            let nfds = unsafe {
+                libc::epoll_wait(
+                    epoll_fd,
+                    epoll_events.as_mut_ptr(),
+                                 epoll_events.len() as i32,
+                                 READER_EPOLL_TIMEOUT_MS,
+                )
+            };
+            if nfds < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                tracing::warn!("input reader epoll_wait error: {}", err);
+                continue;
+            }
+            if nfds == 0 {
+                continue;
+            }
+            let mut batch = Vec::new();
+            for epoll_event in epoll_events.iter().take(nfds as usize) {
+                let fd = epoll_event.u64 as RawFd;
+                if epoll_event.events & (libc::EPOLLERR as u32 | libc::EPOLLHUP as u32) != 0 {
+                    tracing::warn!("input fd {} reported EPOLLERR/EPOLLHUP", fd);
+                }
+                match Self::read_events(fd) {
+                    Ok(events) => batch.extend(events),
+                    Err(e) => tracing::warn!("read_events failed on fd {}: {}", fd, e),
+                }
+            }
+            if !batch.is_empty() && tx.send(batch).is_err() {
+                // Receiver gone: daemon shutting down.
+                break;
+            }
+        }
+    }
+
+    /// Hot-plug rescan. Not supported in threaded reader mode because the
+    /// epoll fd lives in the reader thread and adding an fd from here would
+    /// race with `epoll_wait`. For competitive gaming this is fine: devices
+    /// are expected to be connected once before launching the daemon.
     pub fn rescan_devices(&mut self) -> Result<()> {
+        if self.reader_rx.is_some() {
+            tracing::debug!("rescan_devices is a no-op in threaded reader mode");
+            return Ok(());
+        }
+        // Fallback path used by tests: direct epoll management.
         let known: HashSet<String> = self.devices.iter().map(|dev| dev.path.clone()).collect();
         let entries = match fs::read_dir("/dev/input") {
             Ok(entries) => entries,
@@ -874,96 +625,78 @@ impl InputCapture {
     }
 
     fn probe_device_open(path: &str) -> Result<Option<DeviceInfo>> {
-        let file = OpenOptions::new()
-            .read(true)
-            .open(path)
-            .map_err(PhantomError::Io)?;
-
+        let file = OpenOptions::new().read(true).open(path).map_err(PhantomError::Io)?;
         let fd = file.as_raw_fd();
 
-        // Read device name
         let mut name_buf = [0u8; 256];
         let name_len = unsafe {
-            libc::ioctl(
-                fd,
-                eviocgname_request(name_buf.len()),
-                name_buf.as_mut_ptr(),
-            )
+            libc::ioctl(fd, eviocgname_request(name_buf.len()), name_buf.as_mut_ptr())
         };
         let device_name = if name_len > 0 {
             String::from_utf8_lossy(&name_buf[..name_len as usize])
-                .trim_end_matches('\0')
-                .to_string()
+            .trim_end_matches('\0')
+            .to_string()
         } else {
             "unknown".to_string()
         };
 
-        // Skip our own device
+        // Skip our own virtual output device to avoid feedback loops.
         if device_name.contains("Phantom") {
             return Ok(None);
         }
 
-        // Check event type capabilities
+        // Skip known problematic companion interfaces and macro pads that
+        // flood the evdev buffer with idle heartbeat traffic.
+        const EXCLUDED_NAME_FRAGMENTS: &[&str] = &[
+            "SayoDevice",
+            "Stream Deck",
+            "Elgato",
+        ];
+        if EXCLUDED_NAME_FRAGMENTS.iter().any(|frag| device_name.contains(frag)) {
+            tracing::info!("skipping excluded device: {} ({})", path, device_name);
+            return Ok(None);
+        }
+
         let mut ev_bits = [0u8; EVDEV_CAP_MAX.div_ceil(8)];
         let ret = unsafe {
-            libc::ioctl(
-                fd,
-                eviocgbit_request(0, ev_bits.len()),
-                ev_bits.as_mut_ptr(),
-            )
+            libc::ioctl(fd, eviocgbit_request(0, ev_bits.len()), ev_bits.as_mut_ptr())
         };
         if ret < 0 {
             return Ok(None);
         }
-
         let has_key = test_bit(EV_KEY, &ev_bits);
         let has_rel = test_bit(EV_REL, &ev_bits);
         let has_abs = test_bit(EV_ABS, &ev_bits);
-
         if !has_key && !has_rel {
             return Ok(None);
         }
 
-        // Check specific key capabilities for keyboard detection
-        let key_buf_size = (0x114usize + 1).div_ceil(8); // enough for all keys including mouse
+        let key_buf_size = (0x114usize + 1).div_ceil(8);
         let mut key_bits = vec![0u8; key_buf_size];
         let ret = unsafe {
-            libc::ioctl(
-                fd,
-                eviocgbit_request(EV_KEY, key_bits.len()),
-                key_bits.as_mut_ptr(),
-            )
+            libc::ioctl(fd, eviocgbit_request(EV_KEY, key_bits.len()), key_bits.as_mut_ptr())
         };
-        let is_keyboard = ret >= 0 && test_bit(30 /* KEY_A */, &key_bits);
+        let is_keyboard = ret >= 0 && test_bit(30, &key_bits); // KEY_A
         let has_pointer_buttons =
-            ret >= 0 && (test_bit(0x110 /* BTN_LEFT */, &key_bits) || test_bit(0x111, &key_bits));
+        ret >= 0 && (test_bit(0x110, &key_bits) || test_bit(0x111, &key_bits));
 
-        // Check relative axis capabilities for mouse detection
         let mut rel_bits = [0u8; (REL_Y as usize + 1).div_ceil(8)];
         let ret = unsafe {
-            libc::ioctl(
-                fd,
-                eviocgbit_request(EV_REL, rel_bits.len()),
-                rel_bits.as_mut_ptr(),
-            )
+            libc::ioctl(fd, eviocgbit_request(EV_REL, rel_bits.len()), rel_bits.as_mut_ptr())
         };
         let has_rel_pointer =
-            has_rel && ret >= 0 && test_bit(REL_X, &rel_bits) && test_bit(REL_Y, &rel_bits);
+        has_rel && ret >= 0 && test_bit(REL_X, &rel_bits) && test_bit(REL_Y, &rel_bits);
 
         let mut abs_bits = [0u8; (ABS_Y as usize + 1).div_ceil(8)];
         let abs_ret = unsafe {
-            libc::ioctl(
-                fd,
-                eviocgbit_request(EV_ABS, abs_bits.len()),
-                abs_bits.as_mut_ptr(),
-            )
+            libc::ioctl(fd, eviocgbit_request(EV_ABS, abs_bits.len()), abs_bits.as_mut_ptr())
         };
         let name_lower = device_name.to_lowercase();
         let has_abs_pointer =
-            has_abs && abs_ret >= 0 && test_bit(ABS_X, &abs_bits) && test_bit(ABS_Y, &abs_bits);
+        has_abs && abs_ret >= 0 && test_bit(ABS_X, &abs_bits) && test_bit(ABS_Y, &abs_bits);
         let is_touchpad_like = name_lower.contains("touchpad")
-            || name_lower.contains("trackpad")
-            || has_pointer_buttons;
+        || name_lower.contains("trackpad")
+        || has_pointer_buttons;
 
         let pointer_kind = if has_rel_pointer {
             PointerKind::Relative
@@ -982,55 +715,89 @@ impl InputCapture {
         } else {
             None
         };
-
         let is_mouse = !matches!(pointer_kind, PointerKind::None);
-
         if !is_keyboard && !is_mouse {
             return Ok(None);
         }
 
-        // Re-open non-blocking for epoll (NO GRAB)
+        // Re-open as non-blocking for the epoll-based reader.
         drop(file);
         let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(path)
-            .map_err(PhantomError::Io)?;
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(PhantomError::Io)?;
 
         Ok(Some(DeviceInfo {
             path: path.to_string(),
-            name: device_name,
-            file,
-            is_keyboard,
-            is_mouse,
-            pointer_kind,
-            abs_x: None,
-            abs_y: None,
-            abs_range_x,
-            abs_range_y,
-            last_abs_position: None,
-            abs_dirty: false,
-            abs_contact_known: false,
-            abs_touching: false,
-            touch_contact_started_at: None,
-            touch_contact_moved: false,
-            touchpad_drag_hold: false,
-            touchpad_physical_button: false,
-            last_touchpad_tap_release_at: None,
-            pending_touchpad_tap_deadline: None,
-            pressed_keys: HashSet::new(),
-            desynced: false,
+                name: device_name,
+                file,
+                is_keyboard,
+                is_mouse,
+                pointer_kind,
+                abs_x: None,
+                abs_y: None,
+                abs_range_x,
+                abs_range_y,
+                last_abs_position: None,
+                abs_dirty: false,
+                abs_contact_known: false,
+                abs_touching: false,
+                touch_contact_started_at: None,
+                touch_contact_moved: false,
+                touchpad_drag_hold: false,
+                touchpad_physical_button: false,
+                last_touchpad_tap_release_at: None,
+                pending_touchpad_tap_deadline: None,
+                pressed_keys: HashSet::new(),
+                desynced: false,
+                desynced_at: None,
         }))
     }
 
+    /// Poll the next batch of raw events.
+    ///
+    /// In production this drains the mpsc channel filled by the reader
+    /// thread. In tests (`reader_rx == None`) it falls back to a direct
+    /// epoll-based read.
     pub fn poll_events(&self, timeout_ms: i32) -> Result<Vec<(RawFd, RawInputEvent)>> {
+        if let Some(rx) = &self.reader_rx {
+            return Ok(Self::poll_from_channel(rx, timeout_ms));
+        }
+        self.poll_events_direct(timeout_ms)
+    }
+
+    fn poll_from_channel(
+        rx: &Receiver<Vec<(RawFd, RawInputEvent)>>,
+                         timeout_ms: i32,
+    ) -> Vec<(RawFd, RawInputEvent)> {
+        let mut events = Vec::new();
+        match rx.recv_timeout(Duration::from_millis(timeout_ms.max(0) as u64)) {
+            Ok(batch) => events.extend(batch),
+            Err(RecvTimeoutError::Timeout) => return events,
+            Err(RecvTimeoutError::Disconnected) => return events,
+        }
+        // Drain whatever else is already ready without blocking. This keeps
+        // latency low under sustained load and prevents stale data from
+        // accumulating if the main loop is slower than the input rate.
+        loop {
+            match rx.try_recv() {
+                Ok(batch) => events.extend(batch),
+                Err(_) => break,
+            }
+        }
+        events
+    }
+
+    /// Direct epoll-based read used by unit tests only.
+    fn poll_events_direct(&self, timeout_ms: i32) -> Result<Vec<(RawFd, RawInputEvent)>> {
         let mut epoll_events = [libc::epoll_event { events: 0, u64: 0 }; 16];
         let nfds = unsafe {
             libc::epoll_wait(
                 self.epoll_fd,
                 epoll_events.as_mut_ptr(),
-                epoll_events.len() as i32,
-                timeout_ms,
+                             epoll_events.len() as i32,
+                             timeout_ms,
             )
         };
         if nfds < 0 {
@@ -1061,15 +828,11 @@ impl InputCapture {
             type_: 0,
             code: 0,
             value: 0,
-        }; 256];
+        }; READ_BATCH_SIZE];
 
         loop {
             let n = unsafe {
-                libc::read(
-                    fd,
-                    buf.as_mut_ptr().cast::<libc::c_void>(),
-                    std::mem::size_of_val(&buf),
-                )
+                libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), std::mem::size_of_val(&buf))
             };
             if n < 0 {
                 let err = std::io::Error::last_os_error();
@@ -1091,14 +854,40 @@ impl InputCapture {
             }
             let count = n as usize / event_size;
             for event in buf.iter().take(count) {
+                // SYN_DROPPED: the kernel's evdev buffer overflowed and some
+                // events were lost. Everything we already pulled in this
+                // batch may be inconsistent — drop it and forward only the
+                // marker so the main loop can resync from kernel state.
+                if event.type_ == EV_SYN && event.code == SYN_DROPPED {
+                    tracing::warn!("SYN_DROPPED on fd {}: input buffer overflow, propagating marker", fd);
+                    events.clear();
+                    events.push((fd, *event));
+                    continue;
+                }
                 events.push((fd, *event));
             }
         }
         Ok(events)
     }
 
+    /// Release EVIOCGRAB if held. EINVAL means the grab wasn't held —
+    /// treat it as normal and don't spam the log.
+    fn try_release_grab(device: &DeviceInfo) {
+        if let Err(err) = unsafe { eviocgrab(device.fd(), 0) } {
+            let os_err = std::io::Error::from_raw_os_error(err as i32);
+            if !matches!(os_err.raw_os_error(), Some(libc::EINVAL)) {
+                tracing::error!("failed to release grab on {}: {}", device.path, os_err);
+            }
+        }
+    }
+
     pub fn process_events(&mut self, raw: &[(RawFd, RawInputEvent)]) -> Vec<InputEvent> {
-        let mut result = self.flush_pending_touchpad_taps();
+        // Before processing new events, rescue any device that got stuck in
+        // desynced state (SYN_REPORT never arrived).
+        let mut result = self.rescue_stuck_desynced_devices();
+        result.extend(self.flush_pending_touchpad_taps());
+
+        // Accumulate relative mouse deltas per fd and emit them on SYN_REPORT.
         let mut pending_relative: HashMap<RawFd, (i32, i32)> = HashMap::new();
 
         for (fd, event) in raw {
@@ -1118,19 +907,30 @@ impl InputCapture {
 
             if event.type_ == EV_SYN {
                 if event.code == SYN_DROPPED {
+                    // Mark the device as desynced. Do NOT touch EVIOCGRAB
+                    // here: releasing and re-grabbing around every drop was
+                    // causing visible input stalls. We simply ignore the
+                    // device's events until the next SYN_REPORT, then resync.
                     tracing::warn!(
-                        "SYN_DROPPED on fd {}, dropping buffered events until next SYN_REPORT and resyncing key state",
-                        fd
+                        "SYN_DROPPED on fd {} ({}), marking desynced until next SYN_REPORT",
+                                   fd,
+                                   device.name
                     );
                     pending_relative.remove(fd);
                     device.desynced = true;
+                    device.desynced_at = Some(Instant::now());
                     continue;
                 }
                 if event.code == SYN_REPORT && device.desynced {
                     pending_relative.remove(fd);
+                    // Position may be stale after a drop; reset the cached
+                    // absolute pointer location to avoid a phantom jump.
+                    device.last_abs_position = None;
+                    device.abs_dirty = false;
                     match Self::resync_key_state(device) {
                         Ok(events) => {
                             device.desynced = false;
+                            device.desynced_at = None;
                             result.extend(events);
                         }
                         Err(e) => {
@@ -1139,6 +939,8 @@ impl InputCapture {
                                 device.path,
                                 e
                             );
+                            // Restart the rescue timer for another attempt.
+                            device.desynced_at = Some(Instant::now());
                         }
                     }
                     continue;
@@ -1166,11 +968,14 @@ impl InputCapture {
                 continue;
             }
 
+            // Ignore all events from a desynced device except the
+            // SYN_REPORT/SYN_DROPPED markers handled above.
             if device.desynced {
                 continue;
             }
 
             if event.type_ == EV_KEY {
+                // Touchpad-style absolute pointer contact handling.
                 if matches!(device.pointer_kind, PointerKind::Absolute) && event.code == BTN_TOUCH {
                     device.abs_contact_known = true;
                     match event.value {
@@ -1185,8 +990,9 @@ impl InputCapture {
                         }
                         1 => {
                             device.abs_touching = true;
-                            // Seed the next touch contact from its first reported absolute
-                            // position so a fresh finger landing does not jump the owned cursor.
+                            // Seed the next contact from its first reported
+                            // absolute position so a fresh finger landing
+                            // does not jump the cursor.
                             device.last_abs_position = None;
                             device.touch_contact_started_at = Some(Instant::now());
                             device.touch_contact_moved = false;
@@ -1205,19 +1011,19 @@ impl InputCapture {
                     }
                     continue;
                 }
-                // Filter repeat events (value == 2)
+                // Kernel key repeat events (value == 2) are not forwarded;
+                // Android handles auto-repeat itself for keys that need it.
                 if event.value == 2 {
                     continue;
                 }
                 if let Some(key) = evdev_code_to_key(event.code) {
-                    if matches!(device.pointer_kind, PointerKind::Absolute) && key == Key::MouseLeft
-                    {
+                    if matches!(device.pointer_kind, PointerKind::Absolute) && key == Key::MouseLeft {
                         if event.value == 1 {
                             device.pending_touchpad_tap_deadline = None;
                             device.last_touchpad_tap_release_at = None;
                         }
                         device.touchpad_physical_button =
-                            event.value == 1 || device.touchpad_physical_button;
+                        event.value == 1 || device.touchpad_physical_button;
                     }
                     if event.value == 1 {
                         if device.pressed_keys.insert(key) {
@@ -1226,7 +1032,7 @@ impl InputCapture {
                                     device = %device.path,
                                     key = ?key,
                                     pressed = %format_pressed_keys(&device.pressed_keys),
-                                    "translated key press"
+                                                "translated key press"
                                 );
                             }
                             result.push(InputEvent::KeyPress(key));
@@ -1238,7 +1044,7 @@ impl InputCapture {
                                 device = %device.path,
                                 key = ?key,
                                 pressed = %format_pressed_keys(&device.pressed_keys),
-                                "translated key release"
+                                            "translated key release"
                             );
                         }
                         result.push(InputEvent::KeyRelease(key));
@@ -1247,24 +1053,16 @@ impl InputCapture {
             } else if event.type_ == EV_REL {
                 if event.code == REL_X && matches!(device.pointer_kind, PointerKind::Relative) {
                     pending_relative.entry(*fd).or_default().0 += event.value;
-                } else if event.code == REL_Y
-                    && matches!(device.pointer_kind, PointerKind::Relative)
-                {
+                } else if event.code == REL_Y && matches!(device.pointer_kind, PointerKind::Relative) {
                     pending_relative.entry(*fd).or_default().1 += event.value;
                 } else if event.code == REL_WHEEL {
-                    // Map scroll wheel to key press+release
                     if event.value != 0 {
-                        let key = if event.value > 0 {
-                            Key::WheelUp
-                        } else {
-                            Key::WheelDown
-                        };
+                        let key = if event.value > 0 { Key::WheelUp } else { Key::WheelDown };
                         result.push(InputEvent::KeyPress(key));
                         result.push(InputEvent::KeyRelease(key));
                     }
                 }
-            } else if event.type_ == EV_ABS && matches!(device.pointer_kind, PointerKind::Absolute)
-            {
+            } else if event.type_ == EV_ABS && matches!(device.pointer_kind, PointerKind::Absolute) {
                 if event.code == ABS_X {
                     device.abs_x = Some(event.value);
                     device.abs_dirty = true;
@@ -1278,19 +1076,66 @@ impl InputCapture {
         result
     }
 
+    /// Force a resync on devices that have been desynced longer than
+    /// `DESYNC_RESCUE_TIMEOUT`. As a last resort, release EVIOCGRAB so the
+    /// system keeps receiving input from that device.
+    fn rescue_stuck_desynced_devices(&mut self) -> Vec<InputEvent> {
+        let mut events = Vec::new();
+        let now = Instant::now();
+
+        for device in &mut self.devices {
+            if !device.desynced {
+                continue;
+            }
+            let Some(at) = device.desynced_at else {
+                continue;
+            };
+            if now.duration_since(at) < DESYNC_RESCUE_TIMEOUT {
+                continue;
+            }
+            tracing::warn!(
+                "device {} stuck desynced for {:?}, forcing resync",
+                device.path,
+                now.duration_since(at)
+            );
+            device.last_abs_position = None;
+            device.abs_dirty = false;
+            match Self::resync_key_state(device) {
+                Ok(resync_events) => {
+                    device.desynced = false;
+                    device.desynced_at = None;
+                    events.extend(resync_events);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "resync failed for {}: {}, releasing grab as last resort",
+                        device.path,
+                        e
+                    );
+                    // Give control back to the system. The user can press
+                    // F8 again to re-enable capture if needed.
+                    Self::try_release_grab(device);
+                    device.desynced = false;
+                    device.desynced_at = None;
+                }
+            }
+        }
+        events
+    }
+
     fn device_for_fd_mut(&mut self, fd: RawFd) -> Option<&mut DeviceInfo> {
         let idx = *self.fd_to_index.get(&fd)?;
         self.devices.get_mut(idx)
     }
 
+    /// Ask the kernel which keys are currently held down on the device and
+    /// emit synthetic press/release events for any difference. This is the
+    /// authoritative state, so after a desync the engine converges to the
+    /// correct state within one SYN_REPORT.
     fn resync_key_state(device: &mut DeviceInfo) -> Result<Vec<InputEvent>> {
         let mut key_bits = vec![0u8; EVDEV_KEY_BUF_SIZE];
         let ret = unsafe {
-            libc::ioctl(
-                device.fd(),
-                eviocgkey_request(key_bits.len()),
-                key_bits.as_mut_ptr(),
-            )
+            libc::ioctl(device.fd(), eviocgkey_request(key_bits.len()), key_bits.as_mut_ptr())
         };
         if ret < 0 {
             return Err(PhantomError::Io(std::io::Error::last_os_error()));
@@ -1328,6 +1173,7 @@ impl InputCapture {
             _ => return Vec::new(),
         };
 
+        // No active contact: just remember the position for the next delta.
         if device.abs_contact_known && !device.abs_touching {
             device.last_abs_position = Some((next_x, next_y));
             return Vec::new();
@@ -1339,32 +1185,34 @@ impl InputCapture {
 
         let dx = next_x - prev_x;
         let dy = next_y - prev_y;
+        // Suppress the large "re-anchor" jump some touchpads emit when a
+        // finger is lifted and re-placed.
         if absolute_reanchor_jump(dx, device.abs_range_x)
             || absolute_reanchor_jump(dy, device.abs_range_y)
-        {
-            if trace_detail_enabled() {
-                tracing::trace!(
-                    device = %device.path,
-                    dx = dx,
-                    dy = dy,
-                    "ignoring touchpad re-anchor jump"
-                );
+            {
+                if trace_detail_enabled() {
+                    tracing::trace!(
+                        device = %device.path,
+                        dx = dx,
+                        dy = dy,
+                        "ignoring touchpad re-anchor jump"
+                    );
+                }
+                return Vec::new();
             }
-            return Vec::new();
-        }
-        if dx == 0 && dy == 0 {
-            return Vec::new();
-        }
+            if dx == 0 && dy == 0 {
+                return Vec::new();
+            }
 
-        let tap_slop = touchpad_tap_slop(device.abs_range_x, device.abs_range_y);
-        if dx.abs() > tap_slop || dy.abs() > tap_slop {
-            device.touch_contact_moved = true;
-        }
+            let tap_slop = touchpad_tap_slop(device.abs_range_x, device.abs_range_y);
+            if dx.abs() > tap_slop || dy.abs() > tap_slop {
+                device.touch_contact_moved = true;
+            }
 
-        if trace_detail_enabled() {
-            tracing::trace!(device = %device.path, dx = dx, dy = dy, "translated touchpad move");
-        }
-        split_absolute_pointer_motion(dx, dy)
+            if trace_detail_enabled() {
+                tracing::trace!(device = %device.path, dx = dx, dy = dy, "translated touchpad move");
+            }
+            split_absolute_pointer_motion(dx, dy)
     }
 
     pub fn flush_pending_touchpad_taps(&mut self) -> Vec<InputEvent> {
@@ -1396,30 +1244,30 @@ impl InputCapture {
         } else if !device.touchpad_physical_button
             && !device.touch_contact_moved
             && device
-                .touch_contact_started_at
-                .map(|started| started.elapsed() <= TOUCHPAD_TAP_MAX)
-                .unwrap_or(false)
-        {
-            let now = Instant::now();
-            device.last_touchpad_tap_release_at = Some(now);
-            device.pending_touchpad_tap_deadline = Some(now + TOUCHPAD_DOUBLE_TAP_GAP);
-        } else {
-            device.last_touchpad_tap_release_at = None;
-            device.pending_touchpad_tap_deadline = None;
-        }
+            .touch_contact_started_at
+            .map(|started| started.elapsed() <= TOUCHPAD_TAP_MAX)
+            .unwrap_or(false)
+            {
+                let now = Instant::now();
+                device.last_touchpad_tap_release_at = Some(now);
+                device.pending_touchpad_tap_deadline = Some(now + TOUCHPAD_DOUBLE_TAP_GAP);
+            } else {
+                device.last_touchpad_tap_release_at = None;
+                device.pending_touchpad_tap_deadline = None;
+            }
 
-        device.touch_contact_started_at = None;
-        device.touch_contact_moved = false;
-        device.touchpad_drag_hold = false;
-        device.touchpad_physical_button = false;
-        events
+            device.touch_contact_started_at = None;
+            device.touch_contact_moved = false;
+            device.touchpad_drag_hold = false;
+            device.touchpad_physical_button = false;
+            events
     }
 
     fn touchpad_should_begin_drag_hold(device: &DeviceInfo) -> bool {
         device
-            .last_touchpad_tap_release_at
-            .map(|released| released.elapsed() <= TOUCHPAD_DOUBLE_TAP_GAP)
-            .unwrap_or(false)
+        .last_touchpad_tap_release_at
+        .map(|released| released.elapsed() <= TOUCHPAD_DOUBLE_TAP_GAP)
+        .unwrap_or(false)
     }
 
     pub fn device_count(&self) -> usize {
@@ -1511,12 +1359,8 @@ impl InputCapture {
 
         for (index, dev) in self.devices.iter().enumerate() {
             let want = device_should_be_grabbed(dev.is_keyboard, dev.is_mouse, keyboard, mouse);
-            let current = device_should_be_grabbed(
-                dev.is_keyboard,
-                dev.is_mouse,
-                previous_keyboard,
-                previous_mouse,
-            );
+            let current =
+            device_should_be_grabbed(dev.is_keyboard, dev.is_mouse, previous_keyboard, previous_mouse);
             if want == current {
                 continue;
             }
@@ -1526,7 +1370,7 @@ impl InputCapture {
                 let os_err = std::io::Error::from_raw_os_error(err as i32);
                 if matches!(
                     os_err.raw_os_error(),
-                    Some(libc::ENODEV) | Some(libc::ENXIO) | Some(libc::ENOENT)
+                            Some(libc::ENODEV) | Some(libc::ENXIO) | Some(libc::ENOENT)
                 ) {
                     tracing::warn!(
                         path = %dev.path,
@@ -1535,14 +1379,16 @@ impl InputCapture {
                     continue;
                 }
 
+                // Roll back partial application so the caller sees a
+                // consistent state.
                 for (prev_index, prev_grabbed) in applied.iter().rev() {
                     let prev_value = if *prev_grabbed { 1 } else { 0 };
                     let _ = unsafe { eviocgrab(self.devices[*prev_index].fd(), prev_value) };
                 }
                 return Err(PhantomError::IoctlFailed {
                     operation: "EVIOCGRAB".into(),
-                    path: dev.path.clone(),
-                    reason: os_err.to_string(),
+                           path: dev.path.clone(),
+                           reason: os_err.to_string(),
                 });
             }
             applied.push((index, current));
@@ -1553,10 +1399,7 @@ impl InputCapture {
         self.keyboard_grabbed = keyboard;
         self.mouse_grabbed = mouse;
         if keyboard_changed {
-            tracing::info!(
-                "keyboard grab {}",
-                if keyboard { "enabled" } else { "disabled" }
-            );
+            tracing::info!("keyboard grab {}", if keyboard { "enabled" } else { "disabled" });
         }
         if mouse_changed {
             tracing::info!("mouse grab {}", if mouse { "enabled" } else { "disabled" });
@@ -1572,6 +1415,7 @@ impl InputCapture {
             }
             dev.pressed_keys.clear();
             dev.desynced = false;
+            dev.desynced_at = None;
         }
         self.mouse_grabbed = false;
         self.keyboard_grabbed = false;
@@ -1589,15 +1433,28 @@ fn device_should_be_grabbed(
 
 impl Drop for InputCapture {
     fn drop(&mut self) {
+        // Ask the reader thread to stop and wait for it.
+        if let Some(stop) = &self.stop_reader {
+            stop.store(true, Ordering::Relaxed);
+        }
+        if let Some(handle) = self.reader_thread.take() {
+            let _ = handle.join();
+        }
+        // Release all grabs so the system gets full input control back.
         for dev in &mut self.devices {
             unsafe {
                 let _ = eviocgrab(dev.fd(), 0);
             }
             dev.pressed_keys.clear();
             dev.desynced = false;
+            dev.desynced_at = None;
         }
-        unsafe {
-            libc::close(self.epoll_fd);
+        // In direct-poll mode (tests) the epoll fd is owned by us; in
+        // threaded mode the reader thread closes it on exit.
+        if self.reader_rx.is_none() && self.epoll_fd >= 0 {
+            unsafe {
+                libc::close(self.epoll_fd);
+            }
         }
     }
 }
@@ -1611,6 +1468,9 @@ fn test_bit(bit: u16, bits: &[u8]) -> bool {
     (bits[idx] >> off) & 1 != 0
 }
 
+/// Render the current set of pressed keys as a sorted comma-separated
+/// string. Used only in TRACE-level logs to make state transitions
+/// readable when debugging profiles.
 fn format_pressed_keys(keys: &HashSet<Key>) -> String {
     let mut rendered: Vec<String> = keys.iter().map(|key| format!("{:?}", key)).collect();
     rendered.sort();
@@ -1634,21 +1494,15 @@ fn query_abs_range(fd: RawFd, axis: u16) -> Option<(i32, i32)> {
 }
 
 fn absolute_reanchor_jump(delta: i32, range: Option<(i32, i32)>) -> bool {
-    let span = range
-        .map(|(min, max)| (max - min).unsigned_abs() as i32)
-        .unwrap_or_default();
+    let span = range.map(|(min, max)| (max - min).unsigned_abs() as i32).unwrap_or_default();
     let threshold = ((span as f64) * 0.12).round() as i32;
     let threshold = threshold.clamp(64, 1024);
     delta.abs() >= threshold
 }
 
 fn touchpad_tap_slop(range_x: Option<(i32, i32)>, range_y: Option<(i32, i32)>) -> i32 {
-    let span_x = range_x
-        .map(|(min, max)| (max - min).unsigned_abs() as i32)
-        .unwrap_or_default();
-    let span_y = range_y
-        .map(|(min, max)| (max - min).unsigned_abs() as i32)
-        .unwrap_or_default();
+    let span_x = range_x.map(|(min, max)| (max - min).unsigned_abs() as i32).unwrap_or_default();
+    let span_y = range_y.map(|(min, max)| (max - min).unsigned_abs() as i32).unwrap_or_default();
     let span = span_x.max(span_y);
     (((span as f64) * 0.008).round() as i32).clamp(6, 48)
 }
@@ -1695,14 +1549,61 @@ fn eviocgkey_request(len: usize) -> libc::c_ulong {
 }
 
 fn eviocgabs_request(axis: u16) -> libc::c_ulong {
-    nix::request_code_read!(b'E', 0x40 + axis as u8, std::mem::size_of::<InputAbsInfo>())
-        as libc::c_ulong
+    nix::request_code_read!(b'E', 0x40 + axis as u8, std::mem::size_of::<InputAbsInfo>()) as libc::c_ulong
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::io::AsRawFd;
+
+    fn dummy_device(
+        file: File,
+        is_keyboard: bool,
+        is_mouse: bool,
+        pointer_kind: PointerKind,
+    ) -> DeviceInfo {
+        DeviceInfo {
+            path: "/dev/null".into(),
+            name: "Test".into(),
+            file,
+            is_keyboard,
+            is_mouse,
+            pointer_kind,
+            abs_x: None,
+            abs_y: None,
+            abs_range_x: None,
+            abs_range_y: None,
+            last_abs_position: None,
+            abs_dirty: false,
+            abs_contact_known: false,
+            abs_touching: false,
+            touch_contact_started_at: None,
+            touch_contact_moved: false,
+            touchpad_drag_hold: false,
+            touchpad_physical_button: false,
+            last_touchpad_tap_release_at: None,
+            pending_touchpad_tap_deadline: None,
+            pressed_keys: HashSet::new(),
+            desynced: false,
+            desynced_at: None,
+        }
+    }
+
+    /// Build an `InputCapture` in direct-poll mode (no reader thread),
+    /// suitable for unit tests that call `process_events` directly.
+    fn direct_capture(devices: Vec<DeviceInfo>, fd_to_index: HashMap<RawFd, usize>) -> InputCapture {
+        InputCapture {
+            devices,
+            fd_to_index,
+            epoll_fd: -1,
+            mouse_grabbed: false,
+            keyboard_grabbed: false,
+            reader_rx: None,
+            reader_thread: None,
+            stop_reader: None,
+        }
+    }
 
     #[test]
     fn android_keycode_maps_letters_and_withholds_system_keys() {
@@ -1725,7 +1626,7 @@ mod tests {
         assert_eq!(eviocgkey_request(EVDEV_KEY_BUF_SIZE), 0x8060_4518);
         assert_eq!(
             nix::request_code_write!(b'E', 0x90, std::mem::size_of::<libc::c_int>()),
-            0x4004_4590
+                   0x4004_4590
         );
     }
 
@@ -1733,78 +1634,21 @@ mod tests {
     fn relative_mouse_motion_preserves_per_report_cadence() {
         let file = File::open("/dev/null").unwrap();
         let fd = file.as_raw_fd();
-        let mut capture = InputCapture {
-            devices: vec![DeviceInfo {
-                path: "/dev/null".into(),
-                name: "Test Mouse".into(),
-                file,
-                is_keyboard: false,
-                is_mouse: true,
-                pointer_kind: PointerKind::Relative,
-                abs_x: None,
-                abs_y: None,
-                abs_range_x: None,
-                abs_range_y: None,
-                last_abs_position: None,
-                abs_dirty: false,
-                abs_contact_known: false,
-                abs_touching: false,
-                touch_contact_started_at: None,
-                touch_contact_moved: false,
-                touchpad_drag_hold: false,
-                touchpad_physical_button: false,
-                last_touchpad_tap_release_at: None,
-                pending_touchpad_tap_deadline: None,
-                pressed_keys: HashSet::new(),
-                desynced: false,
-            }],
-            fd_to_index: HashMap::from([(fd, 0)]),
-            epoll_fd: -1,
-            mouse_grabbed: false,
-            keyboard_grabbed: false,
-        };
+        let mut capture = direct_capture(
+            vec![dummy_device(file, false, true, PointerKind::Relative)],
+                                         HashMap::from([(fd, 0)]),
+        );
 
         let events = capture.process_events(&[
-            (
-                fd,
-                RawInputEvent {
-                    tv_sec: 0,
-                    tv_usec: 0,
-                    type_: EV_REL,
-                    code: REL_X,
-                    value: 1,
-                },
-            ),
-            (
-                fd,
-                RawInputEvent {
-                    tv_sec: 0,
-                    tv_usec: 0,
-                    type_: EV_REL,
-                    code: REL_Y,
-                    value: 2,
-                },
-            ),
-            (
-                fd,
-                RawInputEvent {
-                    tv_sec: 0,
-                    tv_usec: 0,
-                    type_: EV_SYN,
-                    code: SYN_REPORT,
-                    value: 0,
-                },
-            ),
+            (fd, RawInputEvent { tv_sec: 0, tv_usec: 0, type_: EV_REL, code: REL_X, value: 1 }),
+                                            (fd, RawInputEvent { tv_sec: 0, tv_usec: 0, type_: EV_REL, code: REL_Y, value: 2 }),
+                                            (fd, RawInputEvent { tv_sec: 0, tv_usec: 0, type_: EV_SYN, code: SYN_REPORT, value: 0 }),
         ]);
 
         assert_eq!(events.len(), 1);
         assert!(matches!(
             events[0],
-            InputEvent::MouseMove {
-                dx: 1,
-                dy: 2,
-                source: MouseMotionSource::Relative
-            }
+            InputEvent::MouseMove { dx: 1, dy: 2, source: MouseMotionSource::Relative }
         ));
     }
 
@@ -1812,96 +1656,26 @@ mod tests {
     fn relative_mouse_motion_does_not_merge_across_reports() {
         let file = File::open("/dev/null").unwrap();
         let fd = file.as_raw_fd();
-        let mut capture = InputCapture {
-            devices: vec![DeviceInfo {
-                path: "/dev/null".into(),
-                name: "Test Mouse".into(),
-                file,
-                is_keyboard: false,
-                is_mouse: true,
-                pointer_kind: PointerKind::Relative,
-                abs_x: None,
-                abs_y: None,
-                abs_range_x: None,
-                abs_range_y: None,
-                last_abs_position: None,
-                abs_dirty: false,
-                abs_contact_known: false,
-                abs_touching: false,
-                touch_contact_started_at: None,
-                touch_contact_moved: false,
-                touchpad_drag_hold: false,
-                touchpad_physical_button: false,
-                last_touchpad_tap_release_at: None,
-                pending_touchpad_tap_deadline: None,
-                pressed_keys: HashSet::new(),
-                desynced: false,
-            }],
-            fd_to_index: HashMap::from([(fd, 0)]),
-            epoll_fd: -1,
-            mouse_grabbed: false,
-            keyboard_grabbed: false,
-        };
+        let mut capture = direct_capture(
+            vec![dummy_device(file, false, true, PointerKind::Relative)],
+                                         HashMap::from([(fd, 0)]),
+        );
 
         let events = capture.process_events(&[
-            (
-                fd,
-                RawInputEvent {
-                    tv_sec: 0,
-                    tv_usec: 0,
-                    type_: EV_REL,
-                    code: REL_X,
-                    value: 1,
-                },
-            ),
-            (
-                fd,
-                RawInputEvent {
-                    tv_sec: 0,
-                    tv_usec: 0,
-                    type_: EV_SYN,
-                    code: SYN_REPORT,
-                    value: 0,
-                },
-            ),
-            (
-                fd,
-                RawInputEvent {
-                    tv_sec: 0,
-                    tv_usec: 0,
-                    type_: EV_REL,
-                    code: REL_Y,
-                    value: 2,
-                },
-            ),
-            (
-                fd,
-                RawInputEvent {
-                    tv_sec: 0,
-                    tv_usec: 0,
-                    type_: EV_SYN,
-                    code: SYN_REPORT,
-                    value: 0,
-                },
-            ),
+            (fd, RawInputEvent { tv_sec: 0, tv_usec: 0, type_: EV_REL, code: REL_X, value: 1 }),
+                                            (fd, RawInputEvent { tv_sec: 0, tv_usec: 0, type_: EV_SYN, code: SYN_REPORT, value: 0 }),
+                                            (fd, RawInputEvent { tv_sec: 0, tv_usec: 0, type_: EV_REL, code: REL_Y, value: 2 }),
+                                            (fd, RawInputEvent { tv_sec: 0, tv_usec: 0, type_: EV_SYN, code: SYN_REPORT, value: 0 }),
         ]);
 
         assert_eq!(events.len(), 2);
         assert!(matches!(
             events[0],
-            InputEvent::MouseMove {
-                dx: 1,
-                dy: 0,
-                source: MouseMotionSource::Relative
-            }
+            InputEvent::MouseMove { dx: 1, dy: 0, source: MouseMotionSource::Relative }
         ));
         assert!(matches!(
             events[1],
-            InputEvent::MouseMove {
-                dx: 0,
-                dy: 2,
-                source: MouseMotionSource::Relative
-            }
+            InputEvent::MouseMove { dx: 0, dy: 2, source: MouseMotionSource::Relative }
         ));
     }
 
@@ -1909,16 +1683,8 @@ mod tests {
     fn input_origin_helpers_distinguish_mouse_and_keyboard() {
         assert!(Key::MouseLeft.is_mouse());
         assert!(!Key::A.is_mouse());
-        assert!(InputEvent::MouseMove {
-            dx: 1,
-            dy: 1,
-            source: MouseMotionSource::Relative
-        }
-        .is_mouse_input());
-        assert!(InputEvent::PointerContactStart {
-            source: MouseMotionSource::Absolute
-        }
-        .is_mouse_input());
+        assert!(InputEvent::MouseMove { dx: 1, dy: 1, source: MouseMotionSource::Relative }.is_mouse_input());
+        assert!(InputEvent::PointerContactStart { source: MouseMotionSource::Absolute }.is_mouse_input());
         assert!(InputEvent::KeyPress(Key::MouseRight).is_mouse_input());
         assert!(InputEvent::KeyPress(Key::A).is_keyboard_input());
         assert!(!InputEvent::KeyRelease(Key::MouseLeft).is_keyboard_input());
@@ -1928,120 +1694,32 @@ mod tests {
     fn absolute_pointer_devices_emit_mouse_move_on_syn_report() {
         let file = File::open("/dev/null").unwrap();
         let fd = file.as_raw_fd();
-        let mut capture = InputCapture {
-            devices: vec![DeviceInfo {
-                path: "/dev/null".into(),
-                name: "Test Touchpad".into(),
-                file,
-                is_keyboard: false,
-                is_mouse: true,
-                pointer_kind: PointerKind::Absolute,
-                abs_x: None,
-                abs_y: None,
-                abs_range_x: Some((0, 1000)),
-                abs_range_y: Some((0, 1000)),
-                last_abs_position: None,
-                abs_dirty: false,
-                abs_contact_known: false,
-                abs_touching: false,
-                touch_contact_started_at: None,
-                touch_contact_moved: false,
-                touchpad_drag_hold: false,
-                touchpad_physical_button: false,
-                last_touchpad_tap_release_at: None,
-                pending_touchpad_tap_deadline: None,
-                pressed_keys: HashSet::new(),
-                desynced: false,
-            }],
-            fd_to_index: HashMap::from([(fd, 0)]),
-            epoll_fd: -1,
-            mouse_grabbed: false,
-            keyboard_grabbed: false,
-        };
+        let mut device = dummy_device(file, false, true, PointerKind::Absolute);
+        device.abs_range_x = Some((0, 1000));
+        device.abs_range_y = Some((0, 1000));
+        let mut capture = direct_capture(vec![device], HashMap::from([(fd, 0)]));
 
         let first = capture.process_events(&[
-            (
-                fd,
-                RawInputEvent {
-                    tv_sec: 0,
-                    tv_usec: 0,
-                    type_: EV_ABS,
-                    code: ABS_X,
-                    value: 100,
-                },
-            ),
-            (
-                fd,
-                RawInputEvent {
-                    tv_sec: 0,
-                    tv_usec: 0,
-                    type_: EV_ABS,
-                    code: ABS_Y,
-                    value: 200,
-                },
-            ),
-            (
-                fd,
-                RawInputEvent {
-                    tv_sec: 0,
-                    tv_usec: 0,
-                    type_: EV_SYN,
-                    code: SYN_REPORT,
-                    value: 0,
-                },
-            ),
+            (fd, RawInputEvent { tv_sec: 0, tv_usec: 0, type_: EV_ABS, code: ABS_X, value: 100 }),
+                                           (fd, RawInputEvent { tv_sec: 0, tv_usec: 0, type_: EV_ABS, code: ABS_Y, value: 200 }),
+                                           (fd, RawInputEvent { tv_sec: 0, tv_usec: 0, type_: EV_SYN, code: SYN_REPORT, value: 0 }),
         ]);
         assert!(first.is_empty());
 
         let second = capture.process_events(&[
-            (
-                fd,
-                RawInputEvent {
-                    tv_sec: 0,
-                    tv_usec: 0,
-                    type_: EV_ABS,
-                    code: ABS_X,
-                    value: 112,
-                },
-            ),
-            (
-                fd,
-                RawInputEvent {
-                    tv_sec: 0,
-                    tv_usec: 0,
-                    type_: EV_ABS,
-                    code: ABS_Y,
-                    value: 206,
-                },
-            ),
-            (
-                fd,
-                RawInputEvent {
-                    tv_sec: 0,
-                    tv_usec: 0,
-                    type_: EV_SYN,
-                    code: SYN_REPORT,
-                    value: 0,
-                },
-            ),
+            (fd, RawInputEvent { tv_sec: 0, tv_usec: 0, type_: EV_ABS, code: ABS_X, value: 112 }),
+                                            (fd, RawInputEvent { tv_sec: 0, tv_usec: 0, type_: EV_ABS, code: ABS_Y, value: 206 }),
+                                            (fd, RawInputEvent { tv_sec: 0, tv_usec: 0, type_: EV_SYN, code: SYN_REPORT, value: 0 }),
         ]);
 
         assert_eq!(second.len(), 2);
         assert!(matches!(
             second[0],
-            InputEvent::MouseMove {
-                dx: 6,
-                dy: 3,
-                source: MouseMotionSource::Absolute
-            }
+            InputEvent::MouseMove { dx: 6, dy: 3, source: MouseMotionSource::Absolute }
         ));
         assert!(matches!(
             second[1],
-            InputEvent::MouseMove {
-                dx: 6,
-                dy: 3,
-                source: MouseMotionSource::Absolute
-            }
+            InputEvent::MouseMove { dx: 6, dy: 3, source: MouseMotionSource::Absolute }
         ));
     }
 
@@ -2049,391 +1727,22 @@ mod tests {
     fn absolute_pointer_ignores_large_reanchor_jumps() {
         let file = File::open("/dev/null").unwrap();
         let fd = file.as_raw_fd();
-        let mut capture = InputCapture {
-            devices: vec![DeviceInfo {
-                path: "/dev/null".into(),
-                name: "Test Touchpad".into(),
-                file,
-                is_keyboard: false,
-                is_mouse: true,
-                pointer_kind: PointerKind::Absolute,
-                abs_x: Some(100),
-                abs_y: Some(100),
-                abs_range_x: Some((0, 1000)),
-                abs_range_y: Some((0, 1000)),
-                last_abs_position: Some((100, 100)),
-                abs_dirty: true,
-                abs_contact_known: false,
-                abs_touching: false,
-                touch_contact_started_at: None,
-                touch_contact_moved: false,
-                touchpad_drag_hold: false,
-                touchpad_physical_button: false,
-                last_touchpad_tap_release_at: None,
-                pending_touchpad_tap_deadline: None,
-                pressed_keys: HashSet::new(),
-                desynced: false,
-            }],
-            fd_to_index: HashMap::from([(fd, 0)]),
-            epoll_fd: -1,
-            mouse_grabbed: false,
-            keyboard_grabbed: false,
-        };
+        let mut device = dummy_device(file, false, true, PointerKind::Absolute);
+        device.abs_x = Some(100);
+        device.abs_y = Some(100);
+        device.abs_range_x = Some((0, 1000));
+        device.abs_range_y = Some((0, 1000));
+        device.last_abs_position = Some((100, 100));
+        device.abs_dirty = true;
+        let mut capture = direct_capture(vec![device], HashMap::from([(fd, 0)]));
 
         let events = capture.process_events(&[
-            (
-                fd,
-                RawInputEvent {
-                    tv_sec: 0,
-                    tv_usec: 0,
-                    type_: EV_ABS,
-                    code: ABS_X,
-                    value: 800,
-                },
-            ),
-            (
-                fd,
-                RawInputEvent {
-                    tv_sec: 0,
-                    tv_usec: 0,
-                    type_: EV_ABS,
-                    code: ABS_Y,
-                    value: 850,
-                },
-            ),
-            (
-                fd,
-                RawInputEvent {
-                    tv_sec: 0,
-                    tv_usec: 0,
-                    type_: EV_SYN,
-                    code: SYN_REPORT,
-                    value: 0,
-                },
-            ),
+            (fd, RawInputEvent { tv_sec: 0, tv_usec: 0, type_: EV_ABS, code: ABS_X, value: 800 }),
+                                            (fd, RawInputEvent { tv_sec: 0, tv_usec: 0, type_: EV_ABS, code: ABS_Y, value: 850 }),
+                                            (fd, RawInputEvent { tv_sec: 0, tv_usec: 0, type_: EV_SYN, code: SYN_REPORT, value: 0 }),
         ]);
 
         assert!(events.is_empty());
-    }
-
-    #[test]
-    fn absolute_pointer_seeds_new_touch_contact_without_jump() {
-        let file = File::open("/dev/null").unwrap();
-        let fd = file.as_raw_fd();
-        let mut capture = InputCapture {
-            devices: vec![DeviceInfo {
-                path: "/dev/null".into(),
-                name: "Test Touchpad".into(),
-                file,
-                is_keyboard: false,
-                is_mouse: true,
-                pointer_kind: PointerKind::Absolute,
-                abs_x: Some(100),
-                abs_y: Some(100),
-                abs_range_x: Some((0, 1000)),
-                abs_range_y: Some((0, 1000)),
-                last_abs_position: Some((100, 100)),
-                abs_dirty: false,
-                abs_contact_known: true,
-                abs_touching: false,
-                touch_contact_started_at: None,
-                touch_contact_moved: false,
-                touchpad_drag_hold: false,
-                touchpad_physical_button: false,
-                last_touchpad_tap_release_at: None,
-                pending_touchpad_tap_deadline: None,
-                pressed_keys: HashSet::new(),
-                desynced: false,
-            }],
-            fd_to_index: HashMap::from([(fd, 0)]),
-            epoll_fd: -1,
-            mouse_grabbed: false,
-            keyboard_grabbed: false,
-        };
-
-        let events = capture.process_events(&[
-            (
-                fd,
-                RawInputEvent {
-                    tv_sec: 0,
-                    tv_usec: 0,
-                    type_: EV_KEY,
-                    code: BTN_TOUCH,
-                    value: 1,
-                },
-            ),
-            (
-                fd,
-                RawInputEvent {
-                    tv_sec: 0,
-                    tv_usec: 0,
-                    type_: EV_ABS,
-                    code: ABS_X,
-                    value: 650,
-                },
-            ),
-            (
-                fd,
-                RawInputEvent {
-                    tv_sec: 0,
-                    tv_usec: 0,
-                    type_: EV_ABS,
-                    code: ABS_Y,
-                    value: 700,
-                },
-            ),
-            (
-                fd,
-                RawInputEvent {
-                    tv_sec: 0,
-                    tv_usec: 0,
-                    type_: EV_SYN,
-                    code: SYN_REPORT,
-                    value: 0,
-                },
-            ),
-        ]);
-
-        assert_eq!(events.len(), 1);
-        assert!(matches!(
-            events[0],
-            InputEvent::PointerContactStart {
-                source: MouseMotionSource::Absolute
-            }
-        ));
-    }
-
-    #[test]
-    fn absolute_pointer_keeps_single_step_motion_for_dragging() {
-        let file = File::open("/dev/null").unwrap();
-        let fd = file.as_raw_fd();
-        let mut capture = InputCapture {
-            devices: vec![DeviceInfo {
-                path: "/dev/null".into(),
-                name: "Test Touchpad".into(),
-                file,
-                is_keyboard: false,
-                is_mouse: true,
-                pointer_kind: PointerKind::Absolute,
-                abs_x: Some(100),
-                abs_y: Some(100),
-                abs_range_x: Some((0, 1000)),
-                abs_range_y: Some((0, 1000)),
-                last_abs_position: Some((100, 100)),
-                abs_dirty: false,
-                abs_contact_known: true,
-                abs_touching: true,
-                touch_contact_started_at: Some(Instant::now()),
-                touch_contact_moved: false,
-                touchpad_drag_hold: false,
-                touchpad_physical_button: false,
-                last_touchpad_tap_release_at: None,
-                pending_touchpad_tap_deadline: None,
-                pressed_keys: HashSet::new(),
-                desynced: false,
-            }],
-            fd_to_index: HashMap::from([(fd, 0)]),
-            epoll_fd: -1,
-            mouse_grabbed: false,
-            keyboard_grabbed: false,
-        };
-
-        let events = capture.process_events(&[
-            (
-                fd,
-                RawInputEvent {
-                    tv_sec: 0,
-                    tv_usec: 0,
-                    type_: EV_ABS,
-                    code: ABS_X,
-                    value: 101,
-                },
-            ),
-            (
-                fd,
-                RawInputEvent {
-                    tv_sec: 0,
-                    tv_usec: 0,
-                    type_: EV_ABS,
-                    code: ABS_Y,
-                    value: 101,
-                },
-            ),
-            (
-                fd,
-                RawInputEvent {
-                    tv_sec: 0,
-                    tv_usec: 0,
-                    type_: EV_SYN,
-                    code: SYN_REPORT,
-                    value: 0,
-                },
-            ),
-        ]);
-
-        assert_eq!(events.len(), 1);
-        assert!(matches!(
-            events[0],
-            InputEvent::MouseMove {
-                dx: 1,
-                dy: 1,
-                source: MouseMotionSource::Absolute
-            }
-        ));
-    }
-
-    #[test]
-    fn touchpad_single_tap_synthesizes_left_click() {
-        let file = File::open("/dev/null").unwrap();
-        let fd = file.as_raw_fd();
-        let mut capture = InputCapture {
-            devices: vec![DeviceInfo {
-                path: "/dev/null".into(),
-                name: "Test Touchpad".into(),
-                file,
-                is_keyboard: false,
-                is_mouse: true,
-                pointer_kind: PointerKind::Absolute,
-                abs_x: Some(100),
-                abs_y: Some(100),
-                abs_range_x: Some((0, 1000)),
-                abs_range_y: Some((0, 1000)),
-                last_abs_position: Some((100, 100)),
-                abs_dirty: false,
-                abs_contact_known: true,
-                abs_touching: false,
-                touch_contact_started_at: None,
-                touch_contact_moved: false,
-                touchpad_drag_hold: false,
-                touchpad_physical_button: false,
-                last_touchpad_tap_release_at: None,
-                pending_touchpad_tap_deadline: None,
-                pressed_keys: HashSet::new(),
-                desynced: false,
-            }],
-            fd_to_index: HashMap::from([(fd, 0)]),
-            epoll_fd: -1,
-            mouse_grabbed: false,
-            keyboard_grabbed: false,
-        };
-
-        let events = capture.process_events(&[
-            (
-                fd,
-                RawInputEvent {
-                    tv_sec: 0,
-                    tv_usec: 0,
-                    type_: EV_KEY,
-                    code: BTN_TOUCH,
-                    value: 1,
-                },
-            ),
-            (
-                fd,
-                RawInputEvent {
-                    tv_sec: 0,
-                    tv_usec: 50_000,
-                    type_: EV_KEY,
-                    code: BTN_TOUCH,
-                    value: 0,
-                },
-            ),
-        ]);
-
-        assert_eq!(events.len(), 2);
-        assert!(matches!(
-            events[0],
-            InputEvent::PointerContactStart {
-                source: MouseMotionSource::Absolute
-            }
-        ));
-        assert!(matches!(
-            events[1],
-            InputEvent::PointerContactEnd {
-                source: MouseMotionSource::Absolute
-            }
-        ));
-
-        capture.devices[0].pending_touchpad_tap_deadline = Some(Instant::now());
-        let flush = capture.flush_pending_touchpad_taps();
-        assert_eq!(flush.len(), 2);
-        assert!(matches!(flush[0], InputEvent::KeyPress(Key::MouseLeft)));
-        assert!(matches!(flush[1], InputEvent::KeyRelease(Key::MouseLeft)));
-    }
-
-    #[test]
-    fn touchpad_double_tap_hold_begins_drag_click() {
-        let file = File::open("/dev/null").unwrap();
-        let fd = file.as_raw_fd();
-        let mut capture = InputCapture {
-            devices: vec![DeviceInfo {
-                path: "/dev/null".into(),
-                name: "Test Touchpad".into(),
-                file,
-                is_keyboard: false,
-                is_mouse: true,
-                pointer_kind: PointerKind::Absolute,
-                abs_x: Some(100),
-                abs_y: Some(100),
-                abs_range_x: Some((0, 1000)),
-                abs_range_y: Some((0, 1000)),
-                last_abs_position: Some((100, 100)),
-                abs_dirty: false,
-                abs_contact_known: true,
-                abs_touching: false,
-                touch_contact_started_at: None,
-                touch_contact_moved: false,
-                touchpad_drag_hold: false,
-                touchpad_physical_button: false,
-                last_touchpad_tap_release_at: Some(Instant::now()),
-                pending_touchpad_tap_deadline: None,
-                pressed_keys: HashSet::new(),
-                desynced: false,
-            }],
-            fd_to_index: HashMap::from([(fd, 0)]),
-            epoll_fd: -1,
-            mouse_grabbed: false,
-            keyboard_grabbed: false,
-        };
-
-        let press = capture.process_events(&[(
-            fd,
-            RawInputEvent {
-                tv_sec: 0,
-                tv_usec: 250_000,
-                type_: EV_KEY,
-                code: BTN_TOUCH,
-                value: 1,
-            },
-        )]);
-        assert_eq!(press.len(), 2);
-        assert!(matches!(
-            press[0],
-            InputEvent::PointerContactStart {
-                source: MouseMotionSource::Absolute
-            }
-        ));
-        assert!(matches!(press[1], InputEvent::KeyPress(Key::MouseLeft)));
-        assert!(capture.devices[0].pending_touchpad_tap_deadline.is_none());
-
-        let release = capture.process_events(&[(
-            fd,
-            RawInputEvent {
-                tv_sec: 0,
-                tv_usec: 320_000,
-                type_: EV_KEY,
-                code: BTN_TOUCH,
-                value: 0,
-            },
-        )]);
-        assert_eq!(release.len(), 2);
-        assert!(matches!(
-            release[0],
-            InputEvent::PointerContactEnd {
-                source: MouseMotionSource::Absolute
-            }
-        ));
-        assert!(matches!(release[1], InputEvent::KeyRelease(Key::MouseLeft)));
     }
 
     #[test]
@@ -2446,75 +1755,22 @@ mod tests {
     }
 
     #[test]
-    fn syn_dropped_keeps_device_desynced_when_resync_fails() {
+    fn syn_dropped_keeps_device_desynced_until_report() {
         let file = File::open("/dev/null").unwrap();
         let fd = file.as_raw_fd();
-        let mut capture = InputCapture {
-            devices: vec![DeviceInfo {
-                path: "/dev/null".into(),
-                name: "Test Keyboard".into(),
-                file,
-                is_keyboard: true,
-                is_mouse: false,
-                pointer_kind: PointerKind::None,
-                abs_x: None,
-                abs_y: None,
-                abs_range_x: None,
-                abs_range_y: None,
-                last_abs_position: None,
-                abs_dirty: false,
-                abs_contact_known: false,
-                abs_touching: false,
-                touch_contact_started_at: None,
-                touch_contact_moved: false,
-                touchpad_drag_hold: false,
-                touchpad_physical_button: false,
-                last_touchpad_tap_release_at: None,
-                pending_touchpad_tap_deadline: None,
-                pressed_keys: HashSet::new(),
-                desynced: false,
-            }],
-            fd_to_index: HashMap::from([(fd, 0)]),
-            epoll_fd: -1,
-            mouse_grabbed: false,
-            keyboard_grabbed: false,
-        };
+        let mut capture = direct_capture(
+            vec![dummy_device(file, true, false, PointerKind::None)],
+                                         HashMap::from([(fd, 0)]),
+        );
 
         let events = capture.process_events(&[
-            (
-                fd,
-                RawInputEvent {
-                    tv_sec: 0,
-                    tv_usec: 0,
-                    type_: EV_SYN,
-                    code: SYN_DROPPED,
-                    value: 0,
-                },
-            ),
-            (
-                fd,
-                RawInputEvent {
-                    tv_sec: 0,
-                    tv_usec: 1,
-                    type_: EV_SYN,
-                    code: SYN_REPORT,
-                    value: 0,
-                },
-            ),
-            (
-                fd,
-                RawInputEvent {
-                    tv_sec: 0,
-                    tv_usec: 2,
-                    type_: EV_KEY,
-                    code: 30,
-                    value: 1,
-                },
-            ),
+            (fd, RawInputEvent { tv_sec: 0, tv_usec: 0, type_: EV_SYN, code: SYN_DROPPED, value: 0 }),
+                                            (fd, RawInputEvent { tv_sec: 0, tv_usec: 2, type_: EV_KEY, code: 30, value: 1 }),
         ]);
 
         assert!(events.is_empty());
         assert!(capture.devices[0].desynced);
+        assert!(capture.devices[0].desynced_at.is_some());
         assert!(capture.devices[0].pressed_keys.is_empty());
     }
 }
