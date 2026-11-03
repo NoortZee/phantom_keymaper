@@ -20,6 +20,13 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.HashMap;
 import java.util.Map;
+// [PATCH] imports for INJECT_EXEC / timeout
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 public final class PhantomServer {
     private static final int MAX_SLOTS = 10;
@@ -57,23 +64,43 @@ public final class PhantomServer {
         new PhantomServer(bindHost, port).run();
     }
 
+    // [PATCH] Multithreaded accept: one thread per client,
+    // read timeout, socket closed in finally, accept-loop never dies.
+    // Note: TouchInjector/KeyInjector are designed for a single active client.
+    // If you ever run multiple clients simultaneously, add synchronized to
+    // touchDown/touchMove/touchUp/cancelAll/keyDown/keyUp/releaseAll.
     private void run() throws Exception {
         try (ServerSocket server = new ServerSocket()) {
             server.setReuseAddress(true);
-            server.bind(new InetSocketAddress(InetAddress.getByName(bindHost), port), 1);
+            server.bind(new InetSocketAddress(InetAddress.getByName(bindHost), port), 50);
+            System.out.println("phantom-server listening on " + bindHost + ":" + port);
             while (true) {
-                try (Socket client = server.accept()) {
-                    client.setTcpNoDelay(true);
-                    System.out.println("phantom-server client connected");
-                    runSession(client.getInputStream(), client.getOutputStream());
-                    injector.cancelAll();
-                    keyInjector.releaseAll();
-                    System.out.println("phantom-server client disconnected");
-                } catch (EOFException eof) {
-                    injector.cancelAll();
-                    keyInjector.releaseAll();
-                    System.out.println("phantom-server client closed");
+                final Socket client;
+                try {
+                    client = server.accept();
+                } catch (Exception e) {
+                    System.err.println("phantom-server accept error: " + e);
+                    continue;
                 }
+                Thread t = new Thread(() -> {
+                    try {
+                        client.setTcpNoDelay(true);
+                        client.setSoTimeout(5000);
+                        System.out.println("phantom-server client connected");
+                        runSession(client.getInputStream(), client.getOutputStream());
+                        injector.cancelAll();
+                        keyInjector.releaseAll();
+                        System.out.println("phantom-server client disconnected");
+                    } catch (Exception e) {
+                        System.err.println("phantom-server session error: " + e);
+                        try { injector.cancelAll(); } catch (Exception ignored) {}
+                        try { keyInjector.releaseAll(); } catch (Exception ignored) {}
+                    } finally {
+                        try { client.close(); } catch (Exception ignored) {}
+                    }
+                }, "phantom-client");
+                t.setDaemon(true);
+                t.start();
             }
         }
     }
@@ -377,7 +404,9 @@ public final class PhantomServer {
             for (Integer keycode : held) {
                 try {
                     keyUp(keycode);
-                } catch (Exception ignored) {
+                } catch (Exception e) {
+                    // [PATCH] log instead of swallowing silently
+                    System.err.println("phantom-server keyUp error: " + e);
                 }
             }
             downTimes.clear();
@@ -394,6 +423,15 @@ public final class PhantomServer {
         private static final int INJECT_INPUT_EVENT_MODE_ASYNC = 0;
         private static final Object INPUT_MANAGER;
         private static final Method INJECT_INPUT_EVENT;
+
+        // [PATCH] dedicated pool for injectInputEvent, so a stuck binder call
+        // cannot block the client-handler thread forever.
+        private static final ExecutorService INJECT_EXEC =
+                Executors.newCachedThreadPool(r -> {
+                    Thread t = new Thread(r, "phantom-inject");
+                    t.setDaemon(true);
+                    return t;
+                });
 
         static {
             try {
@@ -413,12 +451,33 @@ public final class PhantomServer {
             }
         }
 
+        // [PATCH] inject with 2s timeout; unwraps InvocationTargetException
+        // so the real cause lands in the log.
         static void inject(InputEvent event) throws Exception {
-            boolean ok = (Boolean) INJECT_INPUT_EVENT.invoke(
-                    INPUT_MANAGER,
-                    event,
-                    INJECT_INPUT_EVENT_MODE_ASYNC
-            );
+            Future<Boolean> f = INJECT_EXEC.submit(() -> {
+                try {
+                    return (Boolean) INJECT_INPUT_EVENT.invoke(
+                            INPUT_MANAGER,
+                            event,
+                            INJECT_INPUT_EVENT_MODE_ASYNC
+                    );
+                } catch (java.lang.reflect.InvocationTargetException ite) {
+                    Throwable cause = ite.getCause();
+                    if (cause instanceof Exception) throw (Exception) cause;
+                    throw new RuntimeException(cause);
+                }
+            });
+            boolean ok;
+            try {
+                ok = f.get(2, TimeUnit.SECONDS);
+            } catch (TimeoutException te) {
+                f.cancel(true);
+                throw new IOException("injectInputEvent timeout (2s)");
+            } catch (ExecutionException ee) {
+                Throwable cause = ee.getCause();
+                if (cause instanceof Exception) throw (Exception) cause;
+                throw new RuntimeException(cause);
+            }
             if (!ok) {
                 throw new IOException("injectInputEvent returned false");
             }

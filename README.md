@@ -235,4 +235,3 @@ Maintainer path:
 
 The project stays explicit: known screen, named runtime states, deterministic
 profiles, Android-first injection. Convenience never wins if it hides those.
-# phantom_keymaper
